@@ -18,7 +18,11 @@ and what is still to come. See [docs/design.md](docs/design.md) for the design, 
 | 5 · Evidence pack | | Release candidate record and all evidence with SHA-256 list |
 | 6 · Verification | a verifier (`gxp-verification`) | Checks the verifier and the `PASS <reference>` comment |
 | 7 · Promote to production | an approver (`gxp-production`) | Checks the approver is neither initiator nor verifier, deploys the same digest, checks it, tags the image |
-| 8 · Record the release | | Git tag `vX.Y.Z`, GitHub release with release record and evidence |
+| 8 · Record the release | | Git tag `vX.Y.Z`, GitHub release with a PDF release report, the release record and the evidence |
+
+If a gate fails (for example the approval comment was missing), use **Re-run failed jobs**: the gate waits
+again and the newest approval counts. Do not use *Re-run all jobs*; the build refuses to build the same
+candidate twice.
 
 ## Using the framework in an application
 
@@ -73,6 +77,9 @@ Settings → Environments → **New environment**:
 | `gxp-verification` | The verifiers | Off (the person who starts a release may verify it) |
 | `gxp-production` | The approvers | **On** (the person who starts a release cannot approve it) |
 
+In both, untick *Allow administrators to bypass configured protection rules*. A bypass leaves no approval
+behind, so the gate job would fail anyway; the intake warns about it early.
+
 `gxp-staging` is created automatically on the first run. The intake job fails if the two gated environments
 are missing or misconfigured, and the gates check the recorded approval against `.gxp/roles.yml` again.
 
@@ -93,5 +100,9 @@ end to end with [gxp-demo-app](https://github.com/Kriss-test-org/gxp-demo-app).
 ## Versioning
 
 Releases are tags `vMAJOR.MINOR.PATCH`. Applications must reference a tag; the framework refuses branch
-references. Pre-release tags such as `v0.1.0-beta.2` work for testing and are marked "not for GxP use" in every
+references. Pre-release tags such as `v0.1.0-beta.3` work for testing and are marked "not for GxP use" in every
 record. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+Release tags must be lightweight (`git tag v1.2.0 <commit>`, no `-a`). For annotated tags, GitHub reports the
+tag object instead of the commit, and release records would not identify the framework commit. The framework
+tests fail on an annotated release tag.

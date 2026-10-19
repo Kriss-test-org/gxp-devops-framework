@@ -14,7 +14,7 @@ permissions:
 jobs:
   lint:
     name: Lint workflows
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,9 +24,30 @@ jobs:
       - name: Run actionlint (includes shellcheck)
         run: docker run --rm -v "${GITHUB_WORKSPACE}:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 
+  release-tag:
+    name: Release tag points at a commit
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check that the tag is lightweight
+        env:
+          TAG: ${{ github.ref_name }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # For annotated tags the OIDC claim job_workflow_sha is the tag object, not the framework
+          # commit, so release records would not identify the commit. Release tags must be lightweight.
+          refs=$(git ls-remote "https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${TAG}" "refs/tags/${TAG}^{}")
+          if grep -qF '^{}' <<<"${refs}"; then
+            echo "::error::${TAG} is an annotated tag. Framework releases must use lightweight tags: git tag ${TAG} <commit>"
+            exit 1
+          fi
+          echo "${TAG} points directly at commit $(cut -f1 <<<"${refs}")"
+
   step-tests:
     name: Workflow step tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

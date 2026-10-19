@@ -91,10 +91,11 @@ Everything from step 1 to step 8 is one workflow run, named `GxP release vX.Y.Z-
 | 5 Evidence pack | Assembles `release-candidate.json` and all evidence with a `SHA256SUMS` list into one artifact. | Missing evidence or configuration. |
 | 6 Verification | Waits for a reviewer of `gxp-verification`. The verifier checks the candidate and approves with the comment `PASS <reference>`, where the reference points to the verification record (in the eQMS). The job then checks the recorded approval. | No approval recorded, rejection, verifier not listed, comment not `PASS <reference>`, or staging now runs a newer candidate. |
 | 7 Promote to production | Waits for a reviewer of `gxp-production`. Checks the approver is listed and is neither the initiator nor the verifier, that staging still runs this candidate and that the registry still holds the digest. Deploys the digest with the production configuration, repeats the checks, tags the image with the version without changing the digest. | Any check fails. |
-| 8 Record the release | Verifies the evidence pack against its SHA-256 list, creates tag `vX.Y.Z` on the candidate's commit and a GitHub release with `release-record.json`, an evidence zip and `SHA256SUMS`. | Evidence altered. |
+| 8 Record the release | Verifies the evidence pack against its SHA-256 list, writes `release-record.json`, generates the PDF release report, creates tag `vX.Y.Z` on the candidate's commit and a GitHub release with the report, the record, an evidence zip and `SHA256SUMS`. | Evidence altered. |
 
 A rejected candidate is fixed on main and re-tagged as the next `-rc.N`. Once the new candidate reaches
-staging, the old run is cancelled.
+staging, the old run is cancelled. A gate that failed for a procedural reason (for example a missing approval
+comment) can be retried with *Re-run failed jobs*; the newest approval counts and the image is not rebuilt.
 
 ## 5. Roles and segregation of duties
 
@@ -124,6 +125,7 @@ Whether a release may be approved without QA is a decision for Quality (see open
 | Verification result and reference | Approval comment on `gxp-verification`, copied into the release record | Verifier |
 | `release-candidate.json` | Evidence pack of the run | Framework |
 | `release-record.json` | GitHub release asset and run artifact | Framework |
+| `release-report-vX.Y.Z.pdf` | GitHub release asset and run artifact; can be attached to the eQMS change record | Framework |
 | Evidence pack (`gxp-evidence-<tag>`) | Actions artifact (90 days in v0.1) and evidence zip on the GitHub release | Framework |
 
 ### Impact assessment (`gxp-impact-assessment/v1`)
@@ -183,6 +185,10 @@ run link; release time.
 - Every framework change is itself a controlled change with an impact assessment for the consuming
   applications. A framework upgrade in an application is a change to that application's release process.
 - Every framework version runs its own tests (actionlint and workflow step tests) on its tag.
+- Release tags are lightweight, so the OIDC claim `job_workflow_sha` is the framework commit. The framework
+  tests fail on an annotated release tag.
+- Jobs run on a pinned runner image (`ubuntu-24.04`), so the tools under the release process do not change
+  without a framework change.
 - Once Enterprise is available, framework releases are published as immutable releases.
 
 ## 10. Roadmap
@@ -214,6 +220,9 @@ run link; release time.
 | D-09 | Open-source scanners in v0.4 | GitHub code scanning is a paid add-on even with Enterprise. |
 | D-10 | eQMS stays the system of record; GitHub references its IDs | GitHub approvals are not Part 11 signatures. |
 | D-11 | Verification is recorded as the `gxp-verification` approval comment `PASS <reference>` | The detailed verification record belongs in the eQMS; the run keeps the result, the verifier and the reference. |
+| D-12 | Every release gets a PDF report generated from `release-record.json` | A human-readable record of the release that can be attached to the eQMS change record. The JSON stays the source. |
+| D-13 | Runners pinned to `ubuntu-24.04` | `ubuntu-latest` moves to new Ubuntu versions without notice. |
+| D-14 | Framework release tags are lightweight | Annotated tags make the recorded framework SHA the tag object instead of the commit. |
 
 ## 12. Open questions
 

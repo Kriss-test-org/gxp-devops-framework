@@ -58,7 +58,7 @@ on:
 jobs:
   intake:
     name: 1 · Release intake
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
@@ -177,6 +177,8 @@ jobs:
                 const rule = (data.protection_rules ?? []).find((r) => r.type === 'required_reviewers');
                 if (!rule) problems.push(`environment ${name} has no required reviewers`);
                 else if (blockSelfReview && !rule.prevent_self_review) problems.push(`environment ${name} must have "Prevent self-review" enabled`);
+                // A bypass leaves no review behind, so the gate job would fail; warn before the run gets there.
+                if (data.can_admins_bypass) core.warning(`Environment ${name} lets administrators bypass its reviewers. Untick "Allow administrators to bypass configured protection rules".`);
               } catch (error) {
                 if (error.status === 404) problems.push(`environment ${name} does not exist`);
                 else core.warning(`Could not read environment ${name} (${error.status ?? error.message}); its approval is still checked when the run reaches it.`);
@@ -327,6 +329,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-intake
           path: ${{ runner.temp }}/gxp-intake
           if-no-files-found: ignore
@@ -334,7 +337,7 @@ jobs:
   unit-tests:
     name: 2 · Unit tests
     needs: intake
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -418,6 +421,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-unit-tests
           path: ${{ inputs.test-results-path }}
           if-no-files-found: error
@@ -425,7 +429,7 @@ jobs:
   build:
     name: 3 · Build image (once)
     needs: [intake, unit-tests]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -504,13 +508,14 @@ jobs:
       - name: Upload build evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-build
           path: ${{ runner.temp }}/gxp-build
 
   staging:
     name: 4 · Staging deployment and automated checks
     needs: [intake, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Records the deployment, so the repository's Environments view shows which candidate is on staging.
     environment: gxp-staging
     permissions:
@@ -619,6 +624,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-staging
           path: ${{ runner.temp }}/gxp-staging
           if-no-files-found: ignore
@@ -647,7 +653,7 @@ jobs:
   evidence:
     name: 5 · Evidence pack
     needs: [intake, build, staging]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
@@ -737,6 +743,7 @@ jobs:
       - name: Upload the evidence pack
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-evidence-${{ needs.intake.outputs.candidate-tag }}
           path: ${{ runner.temp }}/evidence
           retention-days: 90
@@ -745,7 +752,7 @@ jobs:
   verification:
     name: 6 · Verification
     needs: [intake, evidence]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The run waits here until a reviewer of this environment approves. The reviewer verifies the
     # candidate on staging first and approves with a comment "PASS <verification record reference>".
     environment: gxp-verification
@@ -778,7 +785,9 @@ jobs:
             const roles = JSON.parse(stdout.trim() || 'null') ?? {};
 
             const { data: reviews } = await github.rest.actions.getReviewsForRun({ owner, repo, run_id: context.runId });
-            const review = reviews.filter((r) => r.environments.some((e) => e.name === env)).at(-1);
+            // GitHub lists reviews newest first; after "Re-run failed jobs" the newest one counts.
+            const gateReviews = reviews.filter((r) => r.environments.some((e) => e.name === env));
+            const review = gateReviews[0];
             if (!review) {
               core.setFailed(`No review was recorded for ${env}. Give the environment required reviewers (Settings → Environments → ${env}) so the run waits for verification.`);
               return;
@@ -796,7 +805,8 @@ jobs:
             if (onStaging !== tag && onStaging !== `refs/tags/${tag}`) problems.push(`staging now runs ${onStaging}, so ${tag} is superseded`);
 
             const result = { environment: env, verifier, state: review.state, comment,
-                             reference: match ? match[1].trim() : null, checked_at: new Date().toISOString(), problems };
+                             reference: match ? match[1].trim() : null, checked_at: new Date().toISOString(),
+                             reviews_recorded: gateReviews.length, problems };
             fs.mkdirSync(`${process.env.RUNNER_TEMP}/gxp-verification`, { recursive: true });
             fs.writeFileSync(`${process.env.RUNNER_TEMP}/gxp-verification/verification.json`, JSON.stringify(result, null, 2));
             core.setOutput('verifier', verifier);
@@ -806,6 +816,7 @@ jobs:
               ['Verified by', `@${verifier}`],
               ['Result and reference', comment || '(no comment)'],
               ['Candidate on staging', `<code>${onStaging}</code>`],
+              ['Reviews recorded for this gate', `${gateReviews.length} (the newest counts)`],
             ]);
             if (problems.length) summary.addList(problems.map((p) => `❌ ${p}`));
             await summary.write();
@@ -815,6 +826,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-verification
           path: ${{ runner.temp }}/gxp-verification
           if-no-files-found: ignore
@@ -822,7 +834,7 @@ jobs:
   promote:
     name: 7 · Promote to production
     needs: [intake, build, verification]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The run waits here until an approver of this environment approves the release.
     environment: gxp-production
     permissions:
@@ -854,7 +866,9 @@ jobs:
             const roles = JSON.parse(stdout.trim() || 'null') ?? {};
 
             const { data: reviews } = await github.rest.actions.getReviewsForRun({ owner, repo, run_id: context.runId });
-            const review = reviews.filter((r) => r.environments.some((e) => e.name === env)).at(-1);
+            // GitHub lists reviews newest first; after "Re-run failed jobs" the newest one counts.
+            const gateReviews = reviews.filter((r) => r.environments.some((e) => e.name === env));
+            const review = gateReviews[0];
             if (!review) {
               core.setFailed(`No review was recorded for ${env}. Give the environment required reviewers (Settings → Environments → ${env}) so the run waits for approval.`);
               return;
@@ -870,7 +884,7 @@ jobs:
             if (onStaging !== tag && onStaging !== `refs/tags/${tag}`) problems.push(`staging now runs ${onStaging}, so ${tag} is superseded`);
 
             const result = { environment: env, approver, state: review.state, comment: review.comment ?? '',
-                             approved_before: new Date().toISOString(), problems };
+                             approved_before: new Date().toISOString(), reviews_recorded: gateReviews.length, problems };
             fs.mkdirSync(`${process.env.RUNNER_TEMP}/gxp-production`, { recursive: true });
             fs.writeFileSync(`${process.env.RUNNER_TEMP}/gxp-production/approval.json`, JSON.stringify(result, null, 2));
 
@@ -879,6 +893,7 @@ jobs:
               ['Approved by', `@${approver}`],
               ['Comment', review.comment || '(none)'],
               ['Started by / verified by', `@${process.env.INITIATOR} / @${process.env.VERIFIER}`],
+              ['Reviews recorded for this gate', `${gateReviews.length} (the newest counts)`],
             ]);
             if (problems.length) summary.addList(problems.map((p) => `❌ ${p}`));
             await summary.write();
@@ -1007,6 +1022,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-production
           path: ${{ runner.temp }}/gxp-production
           if-no-files-found: ignore
@@ -1014,7 +1030,7 @@ jobs:
   record:
     name: 8 · Record the release
     needs: [intake, promote]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       actions: read
@@ -1050,8 +1066,199 @@ jobs:
               production_checks: ($production[0] | {result, checked_at, checks}),
               released_at: $released_at
             }' > release-record.json
-          zip -qr "evidence-v${VERSION}.zip" "${pack}" gxp-verification gxp-production release-record.json
-          sha256sum release-record.json "evidence-v${VERSION}.zip" > SHA256SUMS
+
+      - name: Collect the run timeline
+        env:
+          DIR: ${{ runner.temp }}/release
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -sSf -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" \
+            > "${DIR}/run-jobs.json"
+
+      - name: Generate the release report page
+        env:
+          DIR: ${{ runner.temp }}/release
+          PACK: gxp-evidence-${{ needs.intake.outputs.candidate-tag }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, html, json, os, re
+          from datetime import datetime, timezone
+
+          d = os.environ["DIR"]
+          pack = os.path.join(d, os.environ["PACK"])
+
+          def load(path, default=None):
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      return json.load(fh)
+              except (OSError, ValueError):
+                  return default
+
+          rec = load(os.path.join(d, "release-record.json"))
+          jobs = (load(os.path.join(d, "run-jobs.json"), {}) or {}).get("jobs", [])
+          unit = load(os.path.join(pack, "gxp-unit-tests", "unit-tests.json"), {}) or {}
+          with open(os.path.join(pack, "SHA256SUMS"), encoding="utf-8") as fh:
+              sums = [line.rstrip("\n").split("  ", 1) for line in fh if line.strip()]
+          with open(os.path.join(d, "release-record.json"), "rb") as fh:
+              record_sha = hashlib.sha256(fh.read()).hexdigest()
+
+          def e(v):
+              return html.escape("" if v is None else str(v))
+          def code(v):
+              return f"<code>{e(v)}</code>"
+          def link(url, text):
+              return f'<a href="{e(url)}">{e(text)}</a>'
+          def when(v):
+              return e(v.replace("T", " ").replace("Z", " UTC")) if v else ""
+          def verdict(v):
+              ok = v in ("pass", "passed", "success", "approved", "released")
+              return f'<span class="{"ok" if ok else "bad"}">{e(v)}</span>'
+          def kv(rows):
+              return '<table class="kv">' + "".join(f"<tr><th>{e(k)}</th><td>{v}</td></tr>" for k, v in rows) + "</table>"
+          def grid(headers, rows):
+              head = "".join(f"<th>{e(h)}</th>" for h in headers)
+              body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows)
+              return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+          app, rel, fw, art = rec["application"], rec["release"], rec["framework"], rec["artifact"]
+          ia, av = rec["impact_assessment"], rec["automated_verification"]
+
+          def stage_number(job):
+              m = re.match(r"(\d+)", job["name"].split(" / ")[-1])
+              return int(m.group(1)) if m else 99
+          jobs = sorted(jobs, key=stage_number)
+          def job_start(word):
+              return next((j.get("started_at") for j in jobs if word in j["name"]), None)
+          stage_rows = [[e(j["name"].split(" / ")[-1]),
+                         verdict(j.get("conclusion") or "in progress (this job)"),
+                         when(j.get("started_at")), when(j.get("completed_at"))] for j in jobs]
+
+          people = [
+              ["Impact assessment approved",
+               ", ".join(e(a["login"]) for a in ia["approval"]["approved_by"]),
+               when(ia["approval"]["approved_by"][0]["submitted_at"]) if ia["approval"]["approved_by"] else "",
+               link(ia["approval"]["url"], f"PR #{ia['approval']['pull_request']}")],
+              ["Release started", e(rel["initiator"]), when(job_start("Release intake")), f"pushed tag {code(rel['candidate_tag'])}"],
+              ["Verified", e(rec["verification"]["verifier"]), when(job_start("Verification")),
+               f"{e(rec['verification']['comment'])}"],
+              ["Approved for production", e(rec["production_approval"]["approver"]), when(job_start("Promote to production")),
+               e(rec["production_approval"]["comment"] or "")],
+          ]
+
+          banner = ('<p class="banner">Framework pre-release: this release is not suitable for GxP use.</p>'
+                    if fw.get("prerelease") else "")
+          ut = av["unit_tests"]
+          trace_rows = [[e(r), e(t["tests"]), e(t["passed"]), e(t["failed"]), e(t.get("skipped", 0))]
+                        for r, t in sorted(ut.get("traceability", {}).items())]
+          test_rows = [[e(t["name"]), e(", ".join(t["requirements"]) or "-"), verdict(t["status"])] for t in unit.get("tests", [])]
+          def check_rows(checks):
+              return [[e(c["check"]), verdict(c["result"]), code(c["detail"])] for c in checks]
+          cfg = rec["configuration"]
+
+          page = f"""<!doctype html>
+          <html lang="en"><head><meta charset="utf-8">
+          <title>GxP release report {e(app['repository'])} {e(rel['version'])}</title>
+          <style>
+            @page {{ size: A4; margin: 14mm 12mm; }}
+            body {{ font-family: "DejaVu Sans", Arial, sans-serif; font-size: 9pt; color: #1f2328; line-height: 1.35; }}
+            h1 {{ font-size: 16pt; margin: 0 0 1mm; }}
+            h2 {{ font-size: 11pt; margin: 6mm 0 2mm; padding-bottom: 1mm; border-bottom: 1px solid #d0d7de; }}
+            table {{ width: 100%; border-collapse: collapse; margin: 1mm 0 3mm; }}
+            th, td {{ border: 1px solid #d0d7de; padding: 1.2mm 1.8mm; text-align: left; vertical-align: top; }}
+            thead th, table.kv th {{ background: #f6f8fa; }}
+            table.kv th {{ width: 30%; }}
+            tr, .block {{ break-inside: avoid; }}
+            h2 {{ break-after: avoid; }}
+            code {{ font-family: "DejaVu Sans Mono", Consolas, monospace; font-size: 7.5pt; word-break: break-all; }}
+            a {{ color: #0969da; }}
+            .ok {{ color: #1a7f37; font-weight: bold; }} .bad {{ color: #cf222e; font-weight: bold; }}
+            .meta {{ color: #59636e; margin: 0 0 3mm; }}
+            .banner {{ border: 1px solid #d4a72c; background: #fff8c5; padding: 2mm 3mm; }}
+            .note {{ color: #59636e; font-size: 8pt; margin-top: 6mm; }}
+          </style></head><body>
+          <h1>GxP release report: {e(app['repository'].split('/')[-1])} {e(rel['version'])}</h1>
+          <p class="meta">Status {verdict(rec['status'])} &middot; released {when(rec['released_at'])} &middot;
+            generated {when(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))} by the GxP DevOps framework {e(fw['version'])}</p>
+          {banner}
+
+          <h2>1. Release</h2>
+          {kv([
+              ("Application", link(app["url"], app["repository"])),
+              ("Version", e(rel["version"])),
+              ("Release candidate", code(rel["candidate_tag"])),
+              ("Commit", code(rel["commit"])),
+              ("Image", code(art["reference"])),
+              ("Built", f"{when(art['built_at'])}, build {code(art['build_id'])}"),
+              ("Framework", f"{e(fw['version'])} ({code(fw['workflow_sha'])})"),
+              ("Release run", link(rec["candidate_run"]["url"], rec["candidate_run"]["url"])),
+          ])}
+
+          <h2>2. Change control and impact assessment</h2>
+          {kv([
+              ("Change control", e(ia["change_control_id"])),
+              ("Change type", e(ia["change_type"])),
+              ("GxP impact / validation path", f"{e(ia['gxp_impact'])} / {e(ia['validation_path'])}"),
+              ("Impacted requirements", e(", ".join(ia["impacted_requirements"]) or "none")),
+              ("Impact assessment", f"{code(ia['path'])}<br>SHA-256 {code(ia['sha256'])}"),
+          ])}
+
+          <h2>3. Decisions and responsibilities</h2>
+          {grid(["Decision", "By", "Recorded", "Detail"], people)}
+
+          <h2>4. Release stages</h2>
+          {grid(["Stage", "Result", "Started", "Completed"], stage_rows)}
+
+          <h2>5. Automated verification</h2>
+          <p>Unit tests: {verdict(ut['result'])}, {e(ut['passed'])} of {e(ut['total'])} passed, {e(ut['failed'])} failed, {e(ut.get('skipped', 0))} skipped.</p>
+          {grid(["Requirement", "Tests", "Passed", "Failed", "Skipped"], trace_rows)}
+          {grid(["Unit test", "Requirements", "Result"], test_rows)}
+          <div class="block"><p>Staging checks: {verdict(av['staging_checks']['result'])} at {when(av['staging_checks']['checked_at'])}</p>
+          {grid(["Check", "Result", "Detail"], check_rows(av["staging_checks"]["checks"]))}</div>
+          <div class="block"><p>Production checks: {verdict(rec['production_checks']['result'])} at {when(rec['production_checks']['checked_at'])}</p>
+          {grid(["Check", "Result", "Detail"], check_rows(rec["production_checks"]["checks"]))}</div>
+
+          <h2>6. Configuration</h2>
+          {grid(["Environment", "File", "SHA-256"], [[e(k), code(v["path"]), code(v["sha256"])] for k, v in cfg.items()])}
+
+          <h2>7. Evidence</h2>
+          <p>Evidence pack {code(rec['evidence_artifact'])}. Every file was checked against these SHA-256 values before this report was written.</p>
+          {grid(["File", "SHA-256"], [[code(p.removeprefix("./")), code(s)] for s, p in sums])}
+
+          <p class="note">Generated from release-record.json (SHA-256 {code(record_sha)}), attached to the GitHub release
+            {e(rec['release_tag'])}. This report is not an electronic signature; the formal approval is recorded in the eQMS
+            under change control {e(ia['change_control_id'])}.</p>
+          </body></html>
+          """
+          with open(os.path.join(d, "release-report.html"), "w", encoding="utf-8") as fh:
+              fh.write(page)
+          print("Wrote release-report.html")
+          PY
+
+      - name: Print the release report to PDF
+        env:
+          DIR: ${{ runner.temp }}/release
+          VERSION: ${{ needs.intake.outputs.version }}
+        run: |
+          set -euo pipefail
+          pdf="${DIR}/release-report-v${VERSION}.pdf"
+          google-chrome --headless --no-sandbox --disable-gpu --no-pdf-header-footer \
+            --print-to-pdf="${pdf}" "file://${DIR}/release-report.html"
+          test -s "${pdf}"
+          echo "Wrote $(basename "${pdf}") ($(stat -c %s "${pdf}") bytes)"
+
+      - name: Package the evidence
+        env:
+          DIR: ${{ runner.temp }}/release
+          VERSION: ${{ needs.intake.outputs.version }}
+          TAG: ${{ needs.intake.outputs.candidate-tag }}
+        run: |
+          set -euo pipefail
+          cd "${DIR}"
+          zip -qr "evidence-v${VERSION}.zip" "gxp-evidence-${TAG}" gxp-verification gxp-production \
+            release-record.json run-jobs.json release-report.html
+          sha256sum release-record.json "release-report-v${VERSION}.pdf" "evidence-v${VERSION}.zip" > SHA256SUMS
 
       - name: Tag and publish the release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -1064,6 +1271,7 @@ jobs:
             const path = require('node:path');
             const { owner, repo } = context.repo;
             const dir = process.env.DIR;
+            const version = process.env.VERSION;
             const rec = JSON.parse(fs.readFileSync(path.join(dir, 'release-record.json'), 'utf8'));
             const tag = rec.release_tag;
 
@@ -1091,13 +1299,13 @@ jobs:
               `| Release run | ${rec.candidate_run.url} |`,
               `| Released at | ${rec.released_at} |`,
               '',
-              'The attached `release-record.json` is the machine-readable record; `evidence-*.zip` holds the evidence. Their SHA-256 values are in `SHA256SUMS`.',
+              `Attached: \`release-report-v${version}.pdf\` (human-readable report), \`release-record.json\` (machine-readable record), \`evidence-v${version}.zip\` (all evidence). Their SHA-256 values are in \`SHA256SUMS\`.`,
             ].join('\n');
 
             const { data: release } = await github.rest.repos.createRelease({
               owner, repo, tag_name: tag, name: `${rec.release.version}`, body, make_latest: 'true',
             });
-            for (const name of ['release-record.json', `evidence-v${process.env.VERSION}.zip`, 'SHA256SUMS']) {
+            for (const name of [`release-report-v${version}.pdf`, 'release-record.json', `evidence-v${version}.zip`, 'SHA256SUMS']) {
               const data = fs.readFileSync(path.join(dir, name));
               await github.rest.repos.uploadReleaseAsset({
                 owner, repo, release_id: release.id, name, data,
@@ -1107,15 +1315,17 @@ jobs:
 
             await core.summary
               .addHeading('8 · Release recorded', 2)
-              .addRaw(`Tagged <code>${tag}</code> on <code>${rec.release.commit.slice(0, 12)}</code> and published <a href="${release.html_url}">release ${rec.release.version}</a>.`, true)
+              .addRaw(`Tagged <code>${tag}</code> on <code>${rec.release.commit.slice(0, 12)}</code> and published <a href="${release.html_url}">release ${rec.release.version}</a> with the PDF report.`, true)
               .addRaw(`Production runs <code>${rec.artifact.reference}</code>, the image built and tested as <code>${rec.release.candidate_tag}</code>.`, true)
               .write();
 
       - name: Upload the release record
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          overwrite: true
           name: gxp-release-record-v${{ needs.intake.outputs.version }}
           path: |
             ${{ runner.temp }}/release/release-record.json
+            ${{ runner.temp }}/release/release-report-v${{ needs.intake.outputs.version }}.pdf
             ${{ runner.temp }}/release/SHA256SUMS
           retention-days: 90

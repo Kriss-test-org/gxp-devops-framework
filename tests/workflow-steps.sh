@@ -107,6 +107,14 @@ echo '{"approver":"bob","comment":"","approved_before":"t","state":"approved"}' 
 echo '{"environment":"production","result":"pass","checked_at":"t","checks":[]}' > "$R"/gxp-production/checks.json
 expect 0 "release record assembled" env DIR="$R" VERSION=0.1.0 TAG=v0.1.0-rc.1 bash -c "$REC_STEP"
 jq -c '{schema, status, release_tag, verification, approver: .production_approval.approver}' "$R"/release-record.json | sed 's/^/      /'
+
+echo "== Release report page"
+echo '{"jobs":[{"name":"Release / 1 · Release intake","conclusion":"success","started_at":"2026-10-19T12:00:00Z","completed_at":"2026-10-19T12:00:10Z"},{"name":"Release / 8 · Record the release","conclusion":null,"started_at":"2026-10-19T12:05:00Z","completed_at":null}]}' > "$R"/run-jobs.json
+PAGE_STEP=$(step record 'Generate the release report page')
+expect 0 "release report page generated" env DIR="$R" PACK=gxp-evidence-v0.1.0-rc.1 bash -c "$PAGE_STEP"
+expect 0 "report shows verification, digest, stages and pre-release warning" bash -c "
+  grep -q 'PASS TR-0042' '$R/release-report.html' && grep -q 'sha256:1111' '$R/release-report.html' &&
+  grep -q 'in progress (this job)' '$R/release-report.html' && grep -q 'not suitable for GxP use' '$R/release-report.html'"
 fresh; R2=$RUNNER_TEMP/release; cp -r "$R" "$R2" 2>/dev/null || true; rm -f "$R2"/release-record.json "$R2"/evidence-*.zip "$R2"/SHA256SUMS
 echo tampered >> "$R2"/gxp-evidence-v0.1.0-rc.1/gxp-staging/checks.json
 expect 1 "tampered evidence stops the release record" env DIR="$R2" VERSION=0.1.0 TAG=v0.1.0-rc.1 bash -c "$REC_STEP"

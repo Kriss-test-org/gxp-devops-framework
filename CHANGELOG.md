@@ -18,6 +18,17 @@ First version of the release flow, as one workflow run per release candidate.
 - `framework-tests.yml`: actionlint and workflow step tests on every change and version tag.
 - Design document with decision log.
 
+### beta.3
+
+- PDF release report (`release-report-vX.Y.Z.pdf`) attached to every release and included in `SHA256SUMS`:
+  release, change control, decisions and responsibilities, stage timeline, unit tests with requirement
+  traceability, staging and production checks, configuration and evidence hashes.
+- Gates can be retried with *Re-run failed jobs*; the newest approval counts (GitHub lists approvals newest
+  first). Evidence uploads overwrite on re-runs.
+- Intake warns when a gate environment lets administrators bypass its reviewers.
+- Runners pinned to `ubuntu-24.04` instead of `ubuntu-latest`.
+- Framework tests fail on annotated release tags, so release records identify the framework commit.
+
 ### beta.2
 
 - Replaced the two workflows and the PR-based release approval of beta.1 with a single run and environment
