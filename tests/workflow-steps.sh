@@ -27,46 +27,89 @@ fresh() {
   export RUNNER_TEMP GITHUB_OUTPUT GITHUB_STEP_SUMMARY
   mkdir -p "$RUNNER_TEMP/gxp-intake"
 }
-export GITHUB_SERVER_URL=https://github.com GITHUB_REPOSITORY=Kriss-test-org/gxp-demo-app GITHUB_RUN_ID=1001 GITHUB_RUN_ATTEMPT=1
+export GITHUB_SERVER_URL=https://github.com GITHUB_REPOSITORY=Kriss-test-org/gxp-demo-app GITHUB_RUN_ID=1001 GITHUB_RUN_ATTEMPT=1 GITHUB_ACTOR=alice
 
-# Application repository with the impact assessment committed on main.
+# Application repository: main with release v0.1.0 (and an old rc tag on the same commit), stage two commits ahead.
 rm -rf /tmp/repo && cp -r "$APP" /tmp/repo && cd /tmp/repo && git init -q && git add -A && git commit -qm base
-COMMIT=$(git rev-parse HEAD); export COMMIT
+git tag v0.1.0-rc.2 && git tag v0.1.0
 git update-ref refs/remotes/origin/main HEAD
+git switch -q -c stage
+echo change > change.txt && git add change.txt && git commit -qm "Show the limits"
+git commit -q --allow-empty -m "Merge pull request #2 from develop"
+STAGE_TIP=$(git rev-parse HEAD)
 
-echo "== Release candidate tag"
-TAG_STEP=$(step intake 'Check the release candidate tag')
-tag_env() { env GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$1" GITHUB_SHA="$2" DEFAULT_BRANCH=main bash -c "$TAG_STEP"; }
-git tag v0.1.0-rc.1
-fresh; expect 0 "valid candidate tag accepted" tag_env v0.1.0-rc.1 "$COMMIT"
-grep -q '^image=ghcr.io/kriss-test-org/gxp-demo-app$' "$GITHUB_OUTPUT" && echo "      image name lower-cased"
-fresh; expect 1 "tag without -rc.N rejected" tag_env v0.1.0 "$COMMIT"
-git switch -q -c side && git commit -q --allow-empty -m "not on main" && SIDE=$(git rev-parse HEAD) && git switch -q main
-fresh; expect 1 "commit not on main rejected" tag_env v0.1.0-rc.2 "$SIDE"
-git tag v0.1.0 "$COMMIT"
-fresh; expect 1 "already released version rejected" tag_env v0.1.0-rc.1 "$COMMIT"
-git tag -d v0.1.0 >/dev/null
+echo "== Candidate"
+CAND_STEP=$(step intake 'Collect the candidate')
+cand() { env STAGE=stage PRODUCTION=main DIR="$RUNNER_TEMP/gxp-intake" GITHUB_REF="$1" bash -c "$CAND_STEP"; }
+fresh; expect 0 "candidate collected from stage" cand refs/heads/stage
+jq -c '{base_tag, commits: (.commits | length)}' "$RUNNER_TEMP/gxp-intake/candidate.json" | sed 's/^/      /'
+expect 0 "previous release is v0.1.0, not an rc tag" jq -e '.base_tag == "v0.1.0"' "$RUNNER_TEMP/gxp-intake/candidate.json"
+fresh; expect 1 "push to another branch rejected" cand refs/heads/develop
+git switch -q main && git commit -q --allow-empty -m "hotfix on main" && git update-ref refs/remotes/origin/main HEAD && git switch -q stage
+fresh; expect 1 "stage missing commits of main rejected" cand refs/heads/stage
+git update-ref refs/remotes/origin/main "$STAGE_TIP"
+fresh; expect 1 "nothing new on stage rejected" cand refs/heads/stage
+git update-ref refs/remotes/origin/main v0.1.0
 
-echo "== Impact assessment"
-IA_STEP=$(step intake 'Validate the impact assessment')
-fresh; expect 0 "valid impact assessment accepted" env VERSION=0.1.0 bash -c "$IA_STEP"
-fresh; expect 1 "missing impact assessment rejected" env VERSION=9.9.9 bash -c "$IA_STEP"
-cp validation/0.1.0/impact-assessment.yml /tmp/ia.bak
-yq -i '.validation_path = "targeted"' validation/0.1.0/impact-assessment.yml
-fresh; expect 1 "high impact with targeted path rejected" env VERSION=0.1.0 bash -c "$IA_STEP"
-cp /tmp/ia.bak validation/0.1.0/impact-assessment.yml
-yq -i 'del(.change_control_id)' validation/0.1.0/impact-assessment.yml
-fresh; expect 1 "missing change control ID rejected" env VERSION=0.1.0 bash -c "$IA_STEP"
-cp /tmp/ia.bak validation/0.1.0/impact-assessment.yml
+echo "== Decide what the release contains"
+DECIDE_STEP=$(step intake 'Decide what the release contains')
+D=/tmp/decide; rm -rf "$D"; mkdir -p "$D"
+jq -n '{commit: "c2", base_tag: "v0.1.0", stage_branch: "stage", production_branch: "main",
+        commits: [{sha: "c1aaaaaaaa", subject: "Show the limits"}, {sha: "c2bbbbbbbb", subject: "Merge pull request #2"}]}' > "$D/candidate.base.json"
+jq -n '{
+  commits: [{sha: "c1aaaaaaaa", subject: "Show the limits", pull_requests: [2]}, {sha: "c2bbbbbbbb", subject: "Merge pull request #2", pull_requests: [2]}],
+  pull_requests: {"2": {number: 2, title: "Show the limits", url: "u/pull/2", author: "alice", merged_by: "alice",
+    merged_at: "2026-10-20T10:00:00Z", head_sha: "h2", base: "stage", head: "develop", linked_issues: [1],
+    commit_authors: ["alice"], reviews: [{login: "bob", state: "APPROVED", commit_id: "h2", submitted_at: "2026-10-20T09:00:00Z", url: "r"}]}},
+  issues: {"1": {type: "Issue", number: 1, title: "Show the specification limits", url: "u/issues/1", state: "OPEN",
+    requester: "alice", created_at: "2026-10-19T08:00:00Z", last_edited_at: null, body_sha256: "abc",
+    comments: [{id: 11, url: "c11", author: "bob", created_at: "2026-10-19T09:00:00Z", last_edited_at: null,
+      body: "/approve\nimpact: low\npath: targeted\ntype: feature\nrequirements: URS-005, URS-001\nreason: Display-only change"}]}}
+}' > "$D/data.base.json"
+# decide <label> <exit> [jq filter for intake data] [jq filter for the candidate]
+decide() {
+  local label=$1 want=$2 data_filter=${3:-.} cand_filter=${4:-.}
+  fresh; local dir="$RUNNER_TEMP/gxp-intake"
+  jq "$data_filter" "$D/data.base.json" > "$dir/intake-data.json"
+  jq "$cand_filter" "$D/candidate.base.json" > "$dir/candidate.json"
+  expect "$want" "$label" env DIR="$dir" PRODUCTION=main RUN_NUMBER=57 bash -c "$DECIDE_STEP"
+}
+printf 'schema: gxp-roles/v2\nchange_approvers: [bob]\nverifiers: [alice]\nrelease_approvers: [bob]\n' > .gxp/roles.yml
+git switch -q main && git add .gxp/roles.yml && git commit -qm roles && git tag -f v0.1.0 >/dev/null && git update-ref refs/remotes/origin/main HEAD && git switch -q stage
 
-echo "== Roles"
-ROLES_STEP=$(step intake 'Check that the initiator may start releases')
-fresh; expect 1 "placeholder roles rejected" env INITIATOR=alice bash -c "$ROLES_STEP"
-printf 'schema: gxp-roles/v1\ninitiators: [alice]\nverifiers: [alice]\napprovers: [bob]\n' > .gxp/roles.yml
-fresh; expect 0 "listed initiator accepted" env INITIATOR=alice bash -c "$ROLES_STEP"
-fresh; expect 1 "unlisted initiator rejected" env INITIATOR=mallory bash -c "$ROLES_STEP"
-printf 'schema: gxp-roles/v1\ninitiators: [alice]\napprovers: [bob]\n' > .gxp/roles.yml
-fresh; expect 1 "roles without verifiers rejected" env INITIATOR=alice bash -c "$ROLES_STEP"
+decide "approved feature becomes 0.2.0-rc.57" 0
+grep -E '^(version|label|code_authors)=' "$GITHUB_OUTPUT" | tr '\n' ' ' | sed 's/^/      /'; echo
+expect 0 "scope records impact, path and requirements" jq -e \
+  '.gxp_impact == "low" and .validation_path == "targeted" and .impacted_requirements == ["URS-001","URS-005"] and .change_requests[0].approved_by == "bob"' \
+  "$RUNNER_TEMP/gxp-intake/change-requests.json"
+APPROVAL='.issues["1"].comments[0].body'
+decide "fix becomes 0.1.1" 0 "$APPROVAL |= sub(\"type: feature\"; \"type: fix\")"
+grep -q '^version=0.1.1$' "$GITHUB_OUTPUT" || { fail=$((fail+1)); echo "FAIL  fix version is 0.1.1"; }
+decide "breaking change becomes 1.0.0" 0 "$APPROVAL |= sub(\"type: feature\"; \"type: breaking\")"
+grep -q '^version=1.0.0$' "$GITHUB_OUTPUT" || { fail=$((fail+1)); echo "FAIL  breaking version is 1.0.0"; }
+decide "first release of a feature is 0.1.0" 0 . '.base_tag = ""'
+grep -q '^version=0.1.0$' "$GITHUB_OUTPUT" || { fail=$((fail+1)); echo "FAIL  first version is 0.1.0"; }
+decide "commit without a pull request rejected" 1 '.commits[0].pull_requests = []'
+decide "pull request without a change request rejected" 1 '.pull_requests["2"].linked_issues = []'
+decide "pull request without code review rejected" 1 '.pull_requests["2"].reviews = []'
+decide "code review by the code author rejected" 1 '.pull_requests["2"].reviews[0].login = "alice"'
+decide "code review of an earlier commit rejected" 1 '.pull_requests["2"].reviews[0].commit_id = "old"'
+decide "change request without approval rejected" 1 '.issues["1"].comments = []'
+decide "approval by the requester rejected" 1 '.issues["1"].requester = "bob"'
+decide "approval by someone not listed rejected" 1 '.issues["1"].comments[0].author = "mallory"'
+decide "edited approval comment rejected" 1 '.issues["1"].comments[0].last_edited_at = "2026-10-19T09:30:00Z"'
+decide "request edited after approval rejected" 1 '.issues["1"].last_edited_at = "2026-10-19T10:00:00Z"'
+decide "request edited before approval accepted" 0 '.issues["1"].last_edited_at = "2026-10-19T08:30:00Z"'
+decide "high impact with targeted path rejected" 1 "$APPROVAL |= sub(\"impact: low\"; \"impact: high\")"
+decide "approval without reason rejected" 1 "$APPROVAL |= sub(\"\\nreason: Display-only change\"; \"\")"
+REJECT='{id: 12, url: "c12", author: "bob", created_at: "2026-10-19T09:10:00Z", last_edited_at: null, body: "/reject not now"}'
+decide "rejected after approval rejected" 1 ".issues[\"1\"].comments += [$REJECT]"
+decide "approved again after rejection accepted" 0 ".issues[\"1\"].comments = [$REJECT] + .issues[\"1\"].comments"
+decide "closed change request rejected" 1 '.issues["1"].state = "CLOSED"'
+decide "reference to a pull request rejected" 1 '.issues["1"] = {type: "PullRequest"}'
+git switch -q main && printf 'schema: gxp-roles/v1\napprovers: [bob]\n' > .gxp/roles.yml && git commit -qam "old roles" && git update-ref refs/remotes/origin/main HEAD && git switch -q stage
+decide "old roles schema rejected" 1
+git update-ref refs/remotes/origin/main main~1
 
 echo "== Unit test summary"
 UT_STEP=$(step unit-tests 'Summarise results and requirement coverage')
@@ -74,7 +117,7 @@ mkdir -p /tmp/tr && cat > /tmp/tr/unit-tests.xml <<'XML'
 <?xml version="1.0" encoding="utf-8"?>
 <testsuites>
   <testcase name="[URS-001] inside is PASS" time="0.1" classname="test"/>
-  <testcase name="[URS-002] outside is OOS" time="0.1" classname="test"><failure message="boom"/></testcase>
+  <testcase name="[URS-005] limits are shown" time="0.1" classname="test"><failure message="boom"/></testcase>
   <testcase name="helper works" time="0.1" classname="test"/>
 </testsuites>
 XML
@@ -85,39 +128,41 @@ rm -rf /tmp/empty && mkdir -p /tmp/empty
 fresh; expect 1 "missing test results stop the release" env RESULTS=/tmp/empty bash -c "$UT_STEP"
 
 echo "== Evidence pack"
+decide "scope for the evidence pack" 0
+SCOPE="$RUNNER_TEMP/gxp-intake"
 fresh; EV=$RUNNER_TEMP/evidence; mkdir -p "$EV"/gxp-intake "$EV"/gxp-build "$EV"/gxp-unit-tests "$EV"/gxp-staging
-echo '{"version":"v0.1.0-beta.2","workflow_ref":"Kriss-test-org/gxp-devops-framework/.github/workflows/gxp-release.yml@refs/tags/v0.1.0-beta.2","workflow_sha":"abc","prerelease":true}' > "$EV"/gxp-intake/framework.json
-yq -o=json '.' validation/0.1.0/impact-assessment.yml > "$EV"/gxp-intake/impact-assessment.json
-echo '{"pull_request":1,"url":"https://github.com/x/pull/1","approvers":[{"login":"bob","submitted_at":"2026-10-19T10:00:00Z","url":"u","state":"APPROVED"}]}' > "$EV"/gxp-intake/impact-approval.json
-echo '{"image":"ghcr.io/kriss-test-org/gxp-demo-app","digest":"sha256:1111","reference":"ghcr.io/kriss-test-org/gxp-demo-app@sha256:1111","tags":["v0.1.0-rc.1","sha-x"],"build_id":"1001.1","built_at":"t","dockerfile_sha256":"d"}' > "$EV"/gxp-build/build.json
+cp "$SCOPE/candidate.json" "$SCOPE/change-requests.json" "$EV"/gxp-intake/
+echo '{"version":"v0.2.0-beta.1","workflow_ref":"Kriss-test-org/gxp-devops-framework/.github/workflows/gxp-release.yml@refs/tags/v0.2.0-beta.1","workflow_sha":"abc","prerelease":true}' > "$EV"/gxp-intake/framework.json
+echo '{"image":"ghcr.io/kriss-test-org/gxp-demo-app","digest":"sha256:1111","reference":"ghcr.io/kriss-test-org/gxp-demo-app@sha256:1111","tags":["0.2.0-rc.57","sha-x"],"build_id":"1001.1","built_at":"t","dockerfile_sha256":"d"}' > "$EV"/gxp-build/build.json
 cp /tmp/tr/unit-tests.json "$EV"/gxp-unit-tests/
 echo '{"environment":"staging","reference":"r","result":"pass","checked_at":"t","checks":[{"check":"a","result":"pass","detail":"d"}]}' > "$EV"/gxp-staging/checks.json
 EV_STEP=$(step evidence 'Assemble the release candidate record')
-expect 0 "release candidate record assembled" env EVIDENCE="$EV" VERSION=0.1.0 TAG=v0.1.0-rc.1 INITIATOR=alice \
+expect 0 "release candidate record assembled" env EVIDENCE="$EV" VERSION=0.2.0 TAG=0.2.0-rc.57 COMMIT="$STAGE_TIP" \
   STAGING_CONFIG=deploy/staging.env PRODUCTION_CONFIG=deploy/production.env bash -c "$EV_STEP"
+expect 0 "record lists change requests, pull requests and code authors" jq -e \
+  '.release.candidate == "0.2.0-rc.57" and .release.previous_release == "v0.1.0" and .impact_assessment.change_requests[0].number == 1
+   and .pull_requests[0].number == 2 and .code_authors == ["alice"] and .evidence_artifact == "gxp-evidence-0.2.0-rc.57"' "$EV"/release-candidate.json
 expect 0 "every evidence file listed in SHA256SUMS" bash -c "cd '$EV' && sha256sum --check --quiet SHA256SUMS"
-jq -c '{release, digest: .artifact.digest, cc: .impact_assessment.change_control_id, unit: .automated_verification.unit_tests.passed}' "$EV"/release-candidate.json | sed 's/^/      /'
 
-echo "== Release record"
+echo "== Release record and report"
 REC_STEP=$(step record 'Assemble the release record')
 fresh; R=$RUNNER_TEMP/release; mkdir -p "$R"/gxp-verification "$R"/gxp-production
-cp -r "$EV" "$R"/gxp-evidence-v0.1.0-rc.1
+cp -r "$EV" "$R"/gxp-evidence-0.2.0-rc.57
 echo '{"verifier":"alice","reference":"TR-0042","comment":"PASS TR-0042","state":"approved"}' > "$R"/gxp-verification/verification.json
 echo '{"approver":"bob","comment":"","approved_before":"t","state":"approved"}' > "$R"/gxp-production/approval.json
 echo '{"environment":"production","result":"pass","checked_at":"t","checks":[]}' > "$R"/gxp-production/checks.json
-expect 0 "release record assembled" env DIR="$R" VERSION=0.1.0 TAG=v0.1.0-rc.1 bash -c "$REC_STEP"
-jq -c '{schema, status, release_tag, verification, approver: .production_approval.approver}' "$R"/release-record.json | sed 's/^/      /'
-
-echo "== Release report page"
-echo '{"jobs":[{"name":"Release / 1 · Release intake","conclusion":"success","started_at":"2026-10-19T12:00:00Z","completed_at":"2026-10-19T12:00:10Z"},{"name":"Release / 8 · Record the release","conclusion":null,"started_at":"2026-10-19T12:05:00Z","completed_at":null}]}' > "$R"/run-jobs.json
+expect 0 "release record assembled" env DIR="$R" VERSION=0.2.0 TAG=0.2.0-rc.57 bash -c "$REC_STEP"
+expect 0 "record is released with tag v0.2.0" jq -e '.schema == "gxp-release-record/v2" and .release_tag == "v0.2.0" and .production_approval.approver == "bob"' "$R"/release-record.json
+echo '{"jobs":[{"name":"Release / 1 · Release intake","conclusion":"success","started_at":"2026-10-20T12:00:00Z","completed_at":"2026-10-20T12:00:10Z"},{"name":"Release / 8 · Release 0.2.0","conclusion":null,"started_at":"2026-10-20T12:05:00Z","completed_at":null}]}' > "$R"/run-jobs.json
 PAGE_STEP=$(step record 'Generate the release report page')
-expect 0 "release report page generated" env DIR="$R" PACK=gxp-evidence-v0.1.0-rc.1 bash -c "$PAGE_STEP"
-expect 0 "report shows verification, digest, stages and pre-release warning" bash -c "
+expect 0 "release report page generated" env DIR="$R" PACK=gxp-evidence-0.2.0-rc.57 bash -c "$PAGE_STEP"
+expect 0 "report shows change request, code review, verification and digest" bash -c "
+  grep -q 'Show the specification limits' '$R/release-report.html' && grep -q 'Code review of' '$R/release-report.html' &&
   grep -q 'PASS TR-0042' '$R/release-report.html' && grep -q 'sha256:1111' '$R/release-report.html' &&
   grep -q 'in progress (this job)' '$R/release-report.html' && grep -q 'not suitable for GxP use' '$R/release-report.html'"
-fresh; R2=$RUNNER_TEMP/release; cp -r "$R" "$R2" 2>/dev/null || true; rm -f "$R2"/release-record.json "$R2"/evidence-*.zip "$R2"/SHA256SUMS
-echo tampered >> "$R2"/gxp-evidence-v0.1.0-rc.1/gxp-staging/checks.json
-expect 1 "tampered evidence stops the release record" env DIR="$R2" VERSION=0.1.0 TAG=v0.1.0-rc.1 bash -c "$REC_STEP"
+fresh; R2=$RUNNER_TEMP/release; cp -r "$R" "$R2"; rm -f "$R2"/release-record.json
+echo tampered >> "$R2"/gxp-evidence-0.2.0-rc.57/gxp-staging/checks.json
+expect 1 "tampered evidence stops the release" env DIR="$R2" VERSION=0.2.0 TAG=0.2.0-rc.57 bash -c "$REC_STEP"
 
 echo; echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

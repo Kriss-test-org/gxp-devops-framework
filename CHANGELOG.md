@@ -1,6 +1,27 @@
 # Changelog
 
-## v0.1.0 (in testing as v0.1.0-beta.N)
+## v0.2.0 (in testing as v0.2.0-beta.N)
+
+From change request to production.
+
+- `gxp-change-request.yml` (new): issues are free-text change requests. `/approve` with impact, path, type,
+  requirements, reason (and optional `cc`) or `/reject`; validation feedback, labels `cr:new`, `cr:approved`,
+  `cr:changed`, `cr:rejected`; editing an approved request withdraws the approval label.
+- `gxp-release.yml`:
+  - Starts on a push to `stage` (a merged pull request from `develop`) instead of a release candidate tag.
+  - Intake collects the commits not yet on `main`, their pull requests and the referenced change requests, and
+    enforces: every commit via a merged PR, every PR reviewed by a change approver who did not write it and
+    linked to a change request, every change request validly approved (not by the requester, not edited,
+    not rejected).
+  - Version generated from the previous release and the change request types; candidate label `X.Y.Z-rc.N`.
+  - Roles schema `gxp-roles/v2` (`change_approvers`, `verifiers`, `release_approvers`), read from `main`.
+  - Production approver must be neither a code author nor the verifier.
+  - Release job moves `main` (fast-forward) to the validated commit, tags `vX.Y.Z`, publishes the release and
+    closes the change requests with `cr:released`.
+  - Release record and PDF report list the change requests, pull requests, reviews and code authors.
+- Impact assessment files and release candidate tags are no longer used.
+
+## v0.1.0 (not released; superseded by v0.2.0)
 
 First version of the release flow, as one workflow run per release candidate.
 

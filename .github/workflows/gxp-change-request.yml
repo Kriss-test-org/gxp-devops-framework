@@ -1,0 +1,144 @@
+# GxP change requests
+#
+# Called by an application repository on issue events. An issue is a free-text change request.
+# A change approver approves it with a comment:
+#
+#   /approve
+#   impact: low                     none | low | medium | high
+#   path: targeted                  abbreviated | targeted | full
+#   type: feature                   fix | feature | breaking   (decides the next version number)
+#   requirements: URS-005, URS-001
+#   reason: Display-only change; the evaluation is unchanged.
+#   cc: CC-1234                     optional eQMS reference
+#
+# or rejects it with "/reject <reason>". This workflow gives immediate feedback and keeps the labels
+# up to date. It is not the authority: the release run re-checks every approval from the issue itself.
+#
+# The caller must grant: issues: write, contents: read.
+
+name: GxP change request
+
+on:
+  workflow_call:
+    inputs:
+      production-branch:
+        description: Branch whose .gxp/roles.yml decides who may approve.
+        type: string
+        default: main
+
+jobs:
+  change-request:
+    name: Change request
+    if: github.event.issue.pull_request == null
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Read the roles
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.production-branch }}
+          sparse-checkout: .gxp
+          persist-credentials: false
+
+      - name: Handle the change request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const number = issue.number;
+            const { stdout } = await exec.getExecOutput('bash', ['-c', "yq -o=json '.' .gxp/roles.yml 2>/dev/null || echo '{}'"], { silent: true });
+            const roles = JSON.parse(stdout.trim() || '{}') ?? {};
+            const approvers = roles.change_approvers ?? [];
+
+            const say = (body) => github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            const label = (names) => github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: names });
+            const unlabel = async (names) => {
+              for (const name of names) {
+                try { await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name }); } catch (error) { if (error.status !== 404) throw error; }
+              }
+            };
+            const hasLabel = (name) => (issue.labels ?? []).some((l) => l.name === name);
+            const howTo = [
+              'An approver from `.gxp/roles.yml` (`change_approvers`) can approve it with a comment like:',
+              '```',
+              '/approve',
+              'impact: low',
+              'path: targeted',
+              'type: feature',
+              'requirements: URS-005, URS-001',
+              'reason: Display-only change; the evaluation is unchanged.',
+              '```',
+              '`impact`: none, low, medium, high · `path`: abbreviated, targeted, full (high needs full, medium needs targeted or full) · `type`: fix, feature, breaking · `cc:` (eQMS reference) is optional.',
+              'Or reject it with `/reject <reason>`. The requester cannot approve their own request.',
+            ].join('\n');
+
+            if (context.eventName === 'issues' && context.payload.action === 'opened') {
+              await label(['cr:new']);
+              await say(`Change request received.\n\n${howTo}`);
+              return;
+            }
+
+            if (context.eventName === 'issues' && context.payload.action === 'edited') {
+              if (context.payload.changes?.body && hasLabel('cr:approved')) {
+                await unlabel(['cr:approved']);
+                await label(['cr:changed']);
+                await say('The request text changed after it was approved, so the approval no longer counts. Please approve it again.');
+              }
+              return;
+            }
+
+            if (context.eventName !== 'issue_comment' || context.payload.action !== 'created') return;
+            const comment = context.payload.comment;
+            const body = (comment.body ?? '').trim();
+            const first = (body.split('\n')[0] ?? '').trim().toLowerCase();
+            if (!first.startsWith('/approve') && !first.startsWith('/reject')) return;
+            const who = comment.user.login;
+
+            const problems = [];
+            if (!approvers.includes(who)) problems.push(`@${who} is not listed under \`change_approvers\` in \`.gxp/roles.yml\``);
+            if (who === issue.user.login) problems.push(`@${who} requested this change and cannot decide on it`);
+            if (problems.length) {
+              await say(`❌ Not accepted: ${problems.join('; ')}.`);
+              return;
+            }
+
+            if (first.startsWith('/reject')) {
+              await unlabel(['cr:new', 'cr:approved', 'cr:changed']);
+              await label(['cr:rejected']);
+              await say(`Rejected by @${who}.`);
+              await github.rest.issues.update({ owner, repo, issue_number: number, state: 'closed', state_reason: 'not_planned' });
+              return;
+            }
+
+            // Same rules as the release intake, which is the authority.
+            const fields = {};
+            for (const line of body.split('\n').slice(1)) {
+              const at = line.indexOf(':');
+              if (at > 0) fields[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+            }
+            const impact = (fields.impact ?? '').toLowerCase();
+            const path = (fields.path ?? '').toLowerCase();
+            const type = (fields.type ?? '').toLowerCase();
+            const requirements = (fields.requirements ?? '').split(/[,\s]+/).filter(Boolean);
+            if (!['none', 'low', 'medium', 'high'].includes(impact)) problems.push('`impact` must be none, low, medium or high');
+            if (!['abbreviated', 'targeted', 'full'].includes(path)) problems.push('`path` must be abbreviated, targeted or full');
+            if (!['fix', 'feature', 'breaking'].includes(type)) problems.push('`type` must be fix, feature or breaking');
+            if (impact !== 'none' && !requirements.length) problems.push('`requirements` must list the affected requirement IDs');
+            if (!fields.reason) problems.push('`reason` is required');
+            if (impact === 'high' && path !== 'full') problems.push('impact high requires path full');
+            if (impact === 'medium' && path === 'abbreviated') problems.push('impact medium requires path targeted or full');
+            if (problems.length) {
+              await say(`❌ Approval not accepted: ${problems.join('; ')}.\n\n${howTo}`);
+              return;
+            }
+
+            await unlabel(['cr:new', 'cr:changed', 'cr:rejected']);
+            await label(['cr:approved', `impact:${impact}`, `type:${type}`]);
+            await say([
+              `✅ Approved by @${who} at ${comment.created_at}: impact **${impact}**, path **${path}**, type **${type}**, requirements ${requirements.join(', ')}${fields.cc ? `, change control ${fields.cc}` : ''}.`,
+              '',
+              'Editing the request text or this approval comment from now on withdraws the approval.',
+            ].join('\n'));

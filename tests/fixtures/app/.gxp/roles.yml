@@ -1,5 +1,7 @@
-schema: gxp-roles/v1
-initiators:
-  - REPLACE_WITH_INITIATOR_GITHUB_USERNAME
-approvers:
-  - REPLACE_WITH_APPROVER_GITHUB_USERNAME
+schema: gxp-roles/v2
+change_approvers:
+  - REPLACE_WITH_IT_GITHUB_USERNAME
+verifiers:
+  - REPLACE_WITH_VERIFIER_GITHUB_USERNAME
+release_approvers:
+  - REPLACE_WITH_IT_GITHUB_USERNAME
