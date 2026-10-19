@@ -1,0 +1,841 @@
+# GxP release candidate
+#
+# Called by an application repository when a release candidate tag (vX.Y.Z-rc.N) is pushed.
+# Builds the image exactly once, deploys that image to (simulated) STAGING, runs the automated
+# checks, assembles the evidence and opens the release approval PR. Merging that PR starts
+# gxp-promote.yml.
+#
+# The caller must grant: contents: write, packages: write, pull-requests: write,
+# id-token: write, actions: read.
+
+name: GxP release candidate
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version used to run the unit tests.
+        type: string
+        default: '22'
+      install-command:
+        description: Command that installs dependencies. Empty to skip.
+        type: string
+        default: npm ci
+      test-command:
+        description: Command that runs the unit tests and writes JUnit XML into test-results-path.
+        type: string
+        default: npm test
+      test-results-path:
+        description: Folder with JUnit XML test results.
+        type: string
+        default: test-results
+      dockerfile:
+        type: string
+        default: Dockerfile
+      build-context:
+        type: string
+        default: .
+      container-port:
+        description: Port the application listens on inside the container.
+        type: number
+        default: 8080
+      staging-config:
+        description: Non-secret STAGING configuration (env file).
+        type: string
+        default: deploy/staging.env
+      production-config:
+        description: Non-secret PRODUCTION configuration (env file). Hashed into the release record.
+        type: string
+        default: deploy/production.env
+      ui-expected-text:
+        description: Text the home page must contain. Empty to skip the check.
+        type: string
+        default: ''
+
+jobs:
+  intake:
+    name: 1 · Release intake
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
+      candidate-tag: ${{ steps.candidate.outputs.candidate_tag }}
+      commit: ${{ steps.candidate.outputs.commit }}
+      image: ${{ steps.candidate.outputs.image }}
+      initiator: ${{ steps.roles.outputs.initiator }}
+    steps:
+      - name: Check out the release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Identify the framework version
+        id: framework
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::The calling workflow must grant 'id-token: write' so the framework can identify its own version."
+            exit 1
+          fi
+          token=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=gxp-framework-identity" | jq -r '.value')
+          echo "::add-mask::${token}"
+          payload=$(cut -d. -f2 <<<"${token}" | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          claims=$(base64 -d <<<"${payload}")
+          ref=$(jq -r '.job_workflow_ref' <<<"${claims}")
+          sha=$(jq -r '.job_workflow_sha' <<<"${claims}")
+          version="${ref##*@refs/tags/}"
+          if [[ "${ref}" != *"@refs/tags/"* ]] || ! [[ "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::The GxP framework must be referenced by a version tag (for example @v1.2.0), not '@${ref##*@}'."
+            exit 1
+          fi
+          prerelease=false
+          if [[ "${version}" == *-* ]]; then
+            prerelease=true
+            echo "::warning::Framework ${version} is a pre-release and must not be used for GxP production releases."
+          fi
+          mkdir -p "${RUNNER_TEMP}/gxp-intake"
+          jq -n --arg version "${version}" --arg ref "${ref}" --arg sha "${sha}" --argjson prerelease "${prerelease}" \
+            '{version: $version, workflow_ref: $ref, workflow_sha: $sha, prerelease: $prerelease}' \
+            > "${RUNNER_TEMP}/gxp-intake/framework.json"
+          echo "Framework: ${ref} (${sha})"
+
+      - name: Check the release candidate tag
+        id: candidate
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ] || ! [[ "${tag}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
+            echo "::error::Releases start from a release candidate tag named vX.Y.Z-rc.N, not '${GITHUB_REF_NAME}'."
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          commit=$(git rev-parse "${GITHUB_SHA}^{commit}")
+          if ! git merge-base --is-ancestor "${commit}" "origin/${DEFAULT_BRANCH}"; then
+            echo "::error::Tag ${tag} points to ${commit:0:7}, which is not on ${DEFAULT_BRANCH}. Release candidates must be cut from ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "::error::Version ${version} is already released (tag v${version} exists). Use a new version number."
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "candidate_tag=${tag}"
+            echo "commit=${commit}"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check that the initiator may start releases
+        id: roles
+        env:
+          INITIATOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ ! -f .gxp/roles.yml ]; then
+            echo "::error::.gxp/roles.yml is missing. It lists who may start and approve releases."
+            exit 1
+          fi
+          roles=$(yq -o=json '.' .gxp/roles.yml)
+          if grep -q 'REPLACE_WITH' <<<"${roles}"; then
+            echo "::error::.gxp/roles.yml still contains placeholder usernames."
+            exit 1
+          fi
+          if ! jq -e --arg u "${INITIATOR}" '.initiators // [] | index($u) != null' <<<"${roles}" >/dev/null; then
+            echo "::error::${INITIATOR} pushed the tag but is not listed under 'initiators' in .gxp/roles.yml."
+            exit 1
+          fi
+          if [ "$(jq '.approvers // [] | length' <<<"${roles}")" -eq 0 ]; then
+            echo "::error::.gxp/roles.yml lists no approvers."
+            exit 1
+          fi
+          echo "initiator=${INITIATOR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate the impact assessment
+        id: impact
+        env:
+          VERSION: ${{ steps.candidate.outputs.version }}
+          COMMIT: ${{ steps.candidate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          file="validation/${VERSION}/impact-assessment.yml"
+          if [ ! -f "${file}" ]; then
+            echo "::error::${file} is missing. Merge the impact assessment for ${VERSION} through a reviewed PR before tagging a release candidate."
+            exit 1
+          fi
+          ia=$(yq -o=json '.' "${file}")
+          errors=$(jq -r --arg v "${VERSION}" '
+            def need(ok; msg): if ok then empty else msg end;
+            def text(f): (f | type) == "string" and (f | length) > 0;
+            [
+              need(.schema == "gxp-impact-assessment/v1"; "schema must be gxp-impact-assessment/v1"),
+              need((.version | tostring) == $v; "version must be \"\($v)\""),
+              need(text(.change_control_id); "change_control_id is required"),
+              need(text(.summary); "summary is required"),
+              need(.change_type as $t | ["new-system","feature","fix","cosmetic","configuration","infrastructure"] | index($t) != null;
+                   "change_type must be one of new-system, feature, fix, cosmetic, configuration, infrastructure"),
+              need(.gxp_impact as $i | ["none","low","medium","high"] | index($i) != null; "gxp_impact must be none, low, medium or high"),
+              need(.validation_path as $p | ["abbreviated","targeted","full"] | index($p) != null; "validation_path must be abbreviated, targeted or full"),
+              need(text(.rationale); "rationale is required"),
+              need((.impacted_requirements | type) == "array" and (.gxp_impact == "none" or (.impacted_requirements | length) > 0);
+                   "impacted_requirements must list the affected requirement IDs (it may be empty only when gxp_impact is none)"),
+              need((.gxp_impact != "high") or (.validation_path == "full"); "gxp_impact high requires validation_path full"),
+              need((.gxp_impact != "medium") or (.validation_path != "abbreviated"); "gxp_impact medium requires validation_path targeted or full")
+            ] | .[]' <<<"${ia}")
+          if [ -n "${errors}" ]; then
+            while IFS= read -r line; do echo "::error file=${file}::${line}"; done <<<"${errors}"
+            exit 1
+          fi
+          cp "${file}" "${RUNNER_TEMP}/gxp-intake/impact-assessment.yml"
+          echo "${ia}" > "${RUNNER_TEMP}/gxp-intake/impact-assessment.json"
+          {
+            echo "file=${file}"
+            echo "change_commit=$(git log -1 --format=%H "${COMMIT}" -- "${file}")"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check that the impact assessment was approved
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          IA_FILE: ${{ steps.impact.outputs.file }}
+          IA_COMMIT: ${{ steps.impact.outputs.change_commit }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { owner, repo } = context.repo;
+            const isHuman = (login) => Boolean(login) && !login.endsWith('[bot]') && login !== 'web-flow';
+
+            async function rolesAt(sha) {
+              const { stdout } = await exec.getExecOutput('bash', ['-c', `git show ${sha}:.gxp/roles.yml | yq -o=json '.'`], { silent: true });
+              return JSON.parse(stdout.trim() || 'null') ?? {};
+            }
+
+            // Approval rules: the latest review of an approver listed in .gxp/roles.yml (as it was
+            // before the PR) approves the final commit of the PR, and that approver neither opened
+            // nor contributed to the PR and is not in `excluded`.
+            async function evaluateApproval(pr, excluded = []) {
+              const problems = [];
+              const roles = await rolesAt(pr.base.sha);
+              const approvers = roles.approvers ?? [];
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+              if (files.some((f) => f.filename === '.gxp/roles.yml')) {
+                problems.push('the PR changes .gxp/roles.yml; role changes need their own PR');
+              }
+              const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
+              const contributors = new Set([pr.user.login, ...commits.flatMap((c) => [c.author?.login, c.committer?.login])].filter(isHuman));
+              const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
+              const latest = new Map();
+              for (const r of reviews) {
+                if (r.state !== 'COMMENTED' && r.state !== 'PENDING') latest.set(r.user.login, r);
+              }
+              const assessed = [...latest.values()].map((r) => {
+                const reasons = [];
+                if (r.state !== 'APPROVED') reasons.push(`latest review is ${r.state}`);
+                if (r.commit_id !== pr.head.sha) reasons.push('approved an earlier commit of the PR');
+                if (!approvers.includes(r.user.login)) reasons.push('not an approver in .gxp/roles.yml');
+                if (contributors.has(r.user.login)) reasons.push('opened or contributed to the PR');
+                if (excluded.includes(r.user.login)) reasons.push('started this release');
+                return { login: r.user.login, state: r.state, submitted_at: r.submitted_at, commit_id: r.commit_id,
+                         review_id: r.id, url: r.html_url, valid: reasons.length === 0, reasons };
+              });
+              const blocking = assessed.filter((a) => a.state === 'CHANGES_REQUESTED' && approvers.includes(a.login));
+              if (blocking.length) problems.push(`changes requested by ${blocking.map((a) => a.login).join(', ')}`);
+              const valid = assessed.filter((a) => a.valid);
+              if (!valid.length) {
+                const detail = assessed.map((a) => `${a.login}: ${a.reasons.join(', ')}`).join('; ') || 'no reviews';
+                problems.push(`no valid approval (${detail})`);
+              }
+              return { problems, approvers: valid, reviews: assessed, contributors: [...contributors] };
+            }
+
+            const file = process.env.IA_FILE;
+            const sha = process.env.IA_COMMIT;
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+            const pr = prs.find((p) => p.merged_at && p.base.ref === process.env.DEFAULT_BRANCH);
+            if (!pr) {
+              core.setFailed(`${file} was last changed by ${sha.slice(0, 7)}, which did not arrive through a merged pull request. Impact assessments must be merged through a reviewed PR.`);
+              return;
+            }
+            const result = await evaluateApproval(pr);
+            const record = { pull_request: pr.number, url: pr.html_url, author: pr.user.login, merged_at: pr.merged_at,
+                             change_commit: sha, ...result };
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/gxp-intake/impact-approval.json`, JSON.stringify(record, null, 2));
+            if (result.problems.length) {
+              core.setFailed(`Impact assessment PR #${pr.number}: ${result.problems.join('; ')}`);
+              return;
+            }
+            core.info(`Impact assessment approved in PR #${pr.number} by ${result.approvers.map((a) => a.login).join(', ')}`);
+
+      - name: Summary
+        if: always()
+        env:
+          TAG: ${{ steps.candidate.outputs.candidate_tag }}
+          COMMIT: ${{ steps.candidate.outputs.commit }}
+          INITIATOR: ${{ github.actor }}
+        run: |
+          dir="${RUNNER_TEMP}/gxp-intake"
+          fw=$(jq -r '"\(.version) (`\(.workflow_sha[0:7])`)"' "${dir}/framework.json" 2>/dev/null || echo "unknown")
+          ia=$(jq -r '"\(.change_control_id) · impact **\(.gxp_impact)** · path **\(.validation_path)** · \(.impacted_requirements | join(", "))"' \
+            "${dir}/impact-assessment.json" 2>/dev/null || echo "not validated")
+          approval=$(jq -r '"[PR #\(.pull_request)](\(.url)) approved by \([.approvers[].login] | join(", "))"' \
+            "${dir}/impact-approval.json" 2>/dev/null || echo "not verified")
+          {
+            echo "## 1 · Release intake"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Release candidate | \`${TAG:-${GITHUB_REF_NAME}}\` → \`${COMMIT:0:12}\` |"
+            echo "| Started by | @${INITIATOR} |"
+            echo "| Framework | ${fw} |"
+            echo "| Impact assessment | ${ia} |"
+            echo "| Impact assessment approval | ${approval} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload intake evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-intake
+          path: ${{ runner.temp }}/gxp-intake
+          if-no-files-found: ignore
+
+  unit-tests:
+    name: 2 · Unit tests
+    needs: intake
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.intake.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Run unit tests
+        run: ${{ inputs.test-command }}
+
+      - name: Summarise results and requirement coverage
+        if: always()
+        env:
+          RESULTS: ${{ inputs.test-results-path }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, re
+          import xml.etree.ElementTree as ET
+
+          results_dir = os.environ["RESULTS"]
+          tests = []
+          for path in sorted(glob.glob(os.path.join(results_dir, "**", "*.xml"), recursive=True)):
+              for case in ET.parse(path).getroot().iter("testcase"):
+                  if case.find("failure") is not None or case.find("error") is not None:
+                      status = "failed"
+                  elif case.find("skipped") is not None:
+                      status = "skipped"
+                  else:
+                      status = "passed"
+                  name = case.get("name", "")
+                  reqs = re.findall(r"\[([A-Z][A-Z0-9]*-\d+)\]", name)
+                  tests.append({"name": name, "status": status, "requirements": reqs, "file": os.path.relpath(path)})
+
+          totals = {s: sum(t["status"] == s for t in tests) for s in ("passed", "failed", "skipped")}
+          trace = {}
+          for t in tests:
+              for r in t["requirements"]:
+                  entry = trace.setdefault(r, {"tests": 0, "passed": 0, "failed": 0, "skipped": 0})
+                  entry["tests"] += 1
+                  entry[t["status"]] += 1
+          summary = {
+              "result": "pass" if tests and totals["failed"] == 0 else "fail",
+              "total": len(tests), **totals,
+              "traceability": dict(sorted(trace.items())),
+              "tests": tests,
+          }
+          os.makedirs(results_dir, exist_ok=True)
+          with open(os.path.join(results_dir, "unit-tests.json"), "w") as fh:
+              json.dump(summary, fh, indent=2)
+
+          lines = ["## 2 · Unit tests", "",
+                   f"**{totals['passed']}/{len(tests)} passed**, {totals['failed']} failed, {totals['skipped']} skipped", "",
+                   "| Requirement | Tests | Passed | Failed |", "|---|---|---|---|"]
+          lines += [f"| {r} | {e['tests']} | {e['passed']} | {e['failed']} |" for r, e in sorted(trace.items())]
+          if not trace:
+              lines.append("| (no tests reference a requirement ID) | | | |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(lines) + "\n")
+          if not tests:
+              print("::error::No JUnit test results were found in " + results_dir)
+              raise SystemExit(1)
+          # Do not rely only on the exit code of the application's test command.
+          if totals["failed"]:
+              print(f"::error::{totals['failed']} unit test(s) failed")
+              raise SystemExit(1)
+          PY
+
+      - name: Upload unit test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-unit-tests
+          path: ${{ inputs.test-results-path }}
+          if-no-files-found: error
+
+  build:
+    name: 3 · Build image (once)
+    needs: [intake, unit-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      reference: ${{ steps.build.outputs.reference }}
+    steps:
+      - name: Check out the release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.intake.outputs.commit }}
+          persist-credentials: false
+
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "${TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and push the image
+        id: build
+        env:
+          IMAGE: ${{ needs.intake.outputs.image }}
+          TAG: ${{ needs.intake.outputs.candidate-tag }}
+          COMMIT: ${{ needs.intake.outputs.commit }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.build-context }}
+        run: |
+          set -euo pipefail
+          if skopeo inspect --raw "docker://${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "::error::${TAG} was already built. Re-run only the failed jobs of the original run, or push a new release candidate tag."
+            exit 1
+          fi
+          created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          build_id="${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          docker buildx build \
+            --file "${DOCKERFILE}" \
+            --build-arg "GIT_COMMIT=${COMMIT}" \
+            --build-arg "BUILD_ID=${build_id}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${COMMIT}" \
+            --label "org.opencontainers.image.created=${created}" \
+            --provenance=false --sbom=false \
+            --tag "${IMAGE}:${TAG}" \
+            --tag "${IMAGE}:sha-${COMMIT}" \
+            --metadata-file "${RUNNER_TEMP}/build-metadata.json" \
+            --push "${CONTEXT}"
+
+          # The digest is the image's identity from here on. Confirm the registry holds exactly it.
+          registry_digest="sha256:$(skopeo inspect --raw "docker://${IMAGE}:${TAG}" | sha256sum | cut -d' ' -f1)"
+          digest=$(jq -r '."containerimage.digest" // empty' "${RUNNER_TEMP}/build-metadata.json")
+          digest="${digest:-${registry_digest}}"
+          if [ "${digest}" != "${registry_digest}" ]; then
+            echo "::error::Built digest ${digest} differs from the registry digest ${registry_digest}."
+            exit 1
+          fi
+          reference="${IMAGE}@${digest}"
+          mkdir -p "${RUNNER_TEMP}/gxp-build"
+          jq -n --arg image "${IMAGE}" --arg digest "${digest}" --arg reference "${reference}" \
+                --arg tag "${TAG}" --arg commit "${COMMIT}" --arg build_id "${build_id}" --arg created "${created}" \
+                --arg dockerfile_sha256 "$(sha256sum "${DOCKERFILE}" | cut -d' ' -f1)" \
+            '{image: $image, digest: $digest, reference: $reference, tags: [$tag, "sha-\($commit)"],
+              build_id: $build_id, built_at: $created, dockerfile_sha256: $dockerfile_sha256}' \
+            > "${RUNNER_TEMP}/gxp-build/build.json"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "reference=${reference}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## 3 · Build image (once)"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${IMAGE}\` |"
+            echo "| Digest | \`${digest}\` |"
+            echo "| Tags | \`${TAG}\`, \`sha-${COMMIT:0:12}\` |"
+            echo "| Build | \`${build_id}\` at ${created} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload build evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-build
+          path: ${{ runner.temp }}/gxp-build
+
+  staging:
+    name: 4 · Staging deployment and automated checks
+    needs: [intake, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out the release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.intake.outputs.commit }}
+          persist-credentials: false
+
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "${TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      # v0.1: STAGING is simulated by running the image on the runner. From v0.3 this step
+      # deploys the same digest to Azure Container Apps.
+      - name: Deploy the image to simulated staging
+        env:
+          REFERENCE: ${{ needs.build.outputs.reference }}
+          CONFIG: ${{ inputs.staging-config }}
+          PORT: ${{ inputs.container-port }}
+          TAG: ${{ needs.intake.outputs.candidate-tag }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "${REFERENCE}"
+          docker run --detach --name gxp-target --publish "8080:${PORT}" \
+            --env-file "${CONFIG}" \
+            --env APP_ENVIRONMENT=staging \
+            --env "APP_RELEASE_VERSION=${TAG#v}" \
+            "${REFERENCE}"
+
+      - name: Run the automated checks
+        env:
+          REFERENCE: ${{ needs.build.outputs.reference }}
+          COMMIT: ${{ needs.intake.outputs.commit }}
+          EXPECTED_ENVIRONMENT: staging
+          EXPECTED_RELEASE: ${{ needs.intake.outputs.candidate-tag }}
+          UI_TEXT: ${{ inputs.ui-expected-text }}
+          STAGE_TITLE: 4 · Staging deployment and automated checks
+          OUT: ${{ runner.temp }}/gxp-staging
+        run: |
+          set -uo pipefail
+          expected_release="${EXPECTED_RELEASE#v}"
+          base="http://127.0.0.1:8080"
+          mkdir -p "${OUT}"
+          checks="[]"
+          record() {
+            checks=$(jq -c --arg c "$1" --arg r "$2" --arg d "$3" '. + [{check: $c, result: $r, detail: $d}]' <<<"${checks}")
+          }
+          for _ in $(seq 1 30); do curl -fsS "${base}/health" >/dev/null 2>&1 && break; sleep 2; done
+
+          configured=$(docker inspect gxp-target --format '{{.Config.Image}}')
+          running_id=$(docker inspect gxp-target --format '{{.Image}}')
+          expected_id=$(docker image inspect "${REFERENCE}" --format '{{.Id}}')
+          if [ "${configured}" = "${REFERENCE}" ] && [ "${running_id}" = "${expected_id}" ]; then
+            record "Running container uses the built image digest" pass "${configured}"
+          else
+            record "Running container uses the built image digest" fail "configured ${configured}, image ${running_id}, expected ${expected_id}"
+          fi
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' "${base}/health")
+          if [ "${code}" = "200" ]; then record "Health endpoint responds" pass "HTTP ${code}"; else record "Health endpoint responds" fail "HTTP ${code}"; fi
+
+          version_json=$(curl -fsS "${base}/version" 2>/dev/null || echo '{}')
+          echo "${version_json}" > "${OUT}/version.json"
+          for field in commit:"${COMMIT}" environment:"${EXPECTED_ENVIRONMENT}" release:"${expected_release}"; do
+            key="${field%%:*}"; want="${field#*:}"
+            got=$(jq -r --arg k "${key}" '.[$k] // "missing"' <<<"${version_json}")
+            if [ "${got}" = "${want}" ]; then record "/version reports ${key}" pass "${got}"; else record "/version reports ${key}" fail "got ${got}, expected ${want}"; fi
+          done
+
+          if [ -n "${UI_TEXT}" ]; then
+            curl -fsS "${base}/" -o "${OUT}/home.html" 2>/dev/null || true
+            if grep -qF "${UI_TEXT}" "${OUT}/home.html" 2>/dev/null; then
+              record "Home page shows expected text" pass "${UI_TEXT}"
+            else
+              record "Home page shows expected text" fail "'${UI_TEXT}' not found"
+            fi
+          fi
+
+          docker logs gxp-target > "${OUT}/container.log" 2>&1 || true
+          failed=$(jq '[.[] | select(.result != "pass")] | length' <<<"${checks}")
+          result=$([ "${failed}" -eq 0 ] && echo pass || echo fail)
+          jq -n --arg environment "${EXPECTED_ENVIRONMENT}" --arg reference "${REFERENCE}" --arg result "${result}" \
+                --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson checks "${checks}" \
+            '{environment: $environment, reference: $reference, result: $result, checked_at: $checked_at, checks: $checks}' \
+            > "${OUT}/checks.json"
+          {
+            echo "## ${STAGE_TITLE}"
+            echo "Target: \`${REFERENCE}\`"
+            echo
+            echo "| Check | Result | Detail |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.check) | \(if .result == "pass" then "✅ pass" else "❌ fail" end) | \(.detail) |"' <<<"${checks}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::${failed} automated check(s) failed."
+            exit 1
+          fi
+
+      - name: Upload staging evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-staging
+          path: ${{ runner.temp }}/gxp-staging
+          if-no-files-found: ignore
+
+  evidence:
+    name: 5 · Evidence pack
+    needs: [intake, build, staging]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out the release candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.intake.outputs.commit }}
+          persist-credentials: false
+
+      - name: Collect the evidence of this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: gxp-*
+          path: ${{ runner.temp }}/evidence
+
+      - name: Assemble the release candidate record
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
+          VERSION: ${{ needs.intake.outputs.version }}
+          TAG: ${{ needs.intake.outputs.candidate-tag }}
+          COMMIT: ${{ needs.intake.outputs.commit }}
+          INITIATOR: ${{ needs.intake.outputs.initiator }}
+          STAGING_CONFIG: ${{ inputs.staging-config }}
+          PRODUCTION_CONFIG: ${{ inputs.production-config }}
+        run: |
+          set -euo pipefail
+          sha() { sha256sum "$1" | cut -d' ' -f1; }
+          for f in "${STAGING_CONFIG}" "${PRODUCTION_CONFIG}"; do
+            [ -f "${f}" ] || { echo "::error::Configuration file ${f} is missing."; exit 1; }
+          done
+          ia_file="validation/${VERSION}/impact-assessment.yml"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n \
+            --arg repository "${GITHUB_REPOSITORY}" --arg repo_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --arg version "${VERSION}" --arg tag "${TAG}" --arg commit "${COMMIT}" --arg initiator "${INITIATOR}" \
+            --slurpfile framework "${EVIDENCE}/gxp-intake/framework.json" \
+            --slurpfile build "${EVIDENCE}/gxp-build/build.json" \
+            --slurpfile ia "${EVIDENCE}/gxp-intake/impact-assessment.json" \
+            --slurpfile approval "${EVIDENCE}/gxp-intake/impact-approval.json" \
+            --slurpfile unit "${EVIDENCE}/gxp-unit-tests/unit-tests.json" \
+            --slurpfile staging "${EVIDENCE}/gxp-staging/checks.json" \
+            --arg ia_file "${ia_file}" --arg ia_sha "$(sha "${ia_file}")" \
+            --arg staging_config "${STAGING_CONFIG}" --arg staging_sha "$(sha "${STAGING_CONFIG}")" \
+            --arg production_config "${PRODUCTION_CONFIG}" --arg production_sha "$(sha "${PRODUCTION_CONFIG}")" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_attempt "${GITHUB_RUN_ATTEMPT}" --arg run_url "${run_url}" \
+            --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              schema: "gxp-release-candidate/v1",
+              application: {repository: $repository, url: $repo_url},
+              release: {version: $version, candidate_tag: $tag, commit: $commit, initiator: $initiator},
+              framework: $framework[0],
+              artifact: ($build[0] | {image, digest, reference, tags, build_id, built_at}),
+              impact_assessment: {
+                path: $ia_file, sha256: $ia_sha,
+                change_control_id: $ia[0].change_control_id, change_type: $ia[0].change_type,
+                gxp_impact: $ia[0].gxp_impact, validation_path: $ia[0].validation_path,
+                impacted_requirements: $ia[0].impacted_requirements,
+                approval: {pull_request: $approval[0].pull_request, url: $approval[0].url,
+                           approved_by: [$approval[0].approvers[] | {login, submitted_at, url}]}
+              },
+              configuration: {
+                staging: {path: $staging_config, sha256: $staging_sha},
+                production: {path: $production_config, sha256: $production_sha}
+              },
+              automated_verification: {
+                unit_tests: ($unit[0] | {result, total, passed, failed, skipped, traceability}),
+                staging_checks: ($staging[0] | {result, checked_at, checks})
+              },
+              candidate_run: {id: ($run_id | tonumber), attempt: ($run_attempt | tonumber), url: $run_url},
+              evidence_artifact: "gxp-evidence-\($tag)",
+              created_at: $created_at
+            }' > "${EVIDENCE}/release-candidate.json"
+
+          cd "${EVIDENCE}"
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > "${RUNNER_TEMP}/SHA256SUMS"
+          mv "${RUNNER_TEMP}/SHA256SUMS" SHA256SUMS
+          {
+            echo "## 5 · Evidence pack"
+            echo "Artifact \`gxp-evidence-${TAG}\` with $(wc -l < SHA256SUMS) files, each listed with its SHA-256 in \`SHA256SUMS\`."
+            echo
+            echo '```json'
+            jq '{release, artifact: .artifact | {digest, reference}, impact_assessment: .impact_assessment | {change_control_id, gxp_impact, validation_path}}' release-candidate.json
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the evidence pack
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-evidence-${{ needs.intake.outputs.candidate-tag }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 90
+          if-no-files-found: error
+
+  release-pr:
+    name: 6 · Open the release approval PR
+    needs: [intake, evidence]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download the evidence pack
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gxp-evidence-${{ needs.intake.outputs.candidate-tag }}
+          path: ${{ runner.temp }}/evidence
+
+      - name: Commit the release record to a release branch
+        id: branch
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
+          VERSION: ${{ needs.intake.outputs.version }}
+          TAG: ${{ needs.intake.outputs.candidate-tag }}
+        run: |
+          set -euo pipefail
+          branch="release/${TAG}"
+          dir="validation/${VERSION}"
+          record="${EVIDENCE}/release-candidate.json"
+          mkdir -p "${dir}"
+          cp "${record}" "${dir}/release-candidate.json"
+          reqs=$(jq -r '.impact_assessment.impacted_requirements | if length == 0 then ["(none)"] else . end | .[]' "${record}")
+          {
+            echo "# Verification record: ${TAG}"
+            echo
+            echo "Complete this record in the release PR before it is approved"
+            echo "(*Files changed* → *⋯* on this file → *Edit file*). The approver must not edit it."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            jq -r '"| Application | \(.application.repository) |",
+                   "| Release candidate | \(.release.candidate_tag) (commit `\(.release.commit[0:12])`) |",
+                   "| Image digest | `\(.artifact.digest)` |",
+                   "| Change control | \(.impact_assessment.change_control_id) |",
+                   "| GxP impact / validation path | \(.impact_assessment.gxp_impact) / \(.impact_assessment.validation_path) |",
+                   "| Automated verification | unit tests \(.automated_verification.unit_tests.passed)/\(.automated_verification.unit_tests.total) passed, staging checks \(.automated_verification.staging_checks.checks | map(select(.result == "pass")) | length)/\(.automated_verification.staging_checks.checks | length) passed ([run](\(.candidate_run.url))) |"' "${record}"
+            echo
+            echo "## Verification performed"
+            echo
+            echo "<!-- One row per impacted requirement or GxP-critical function you verified. -->"
+            echo
+            echo "| Requirement | What was verified | Result | Evidence reference |"
+            echo "|---|---|---|---|"
+            while IFS= read -r r; do echo "| ${r} | | | |"; done <<<"${reqs}"
+            echo
+            echo "## Deviations"
+            echo
+            echo "None."
+            echo
+            echo "## Conclusion"
+            echo
+            echo "<!-- Change PENDING to PASS when verification is complete and all deviations are resolved,"
+            echo "     or to FAIL if this candidate must not be released. Promotion only proceeds on PASS. -->"
+            echo
+            echo "Overall result: PENDING"
+            echo
+            echo "Verified by: <!-- GitHub username -->"
+            echo
+            echo "Date: <!-- YYYY-MM-DD -->"
+          } > "${dir}/verification.md"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git add "${dir}/release-candidate.json" "${dir}/verification.md"
+          git commit -m "Release candidate ${TAG} for approval" -m "Recorded by the GxP framework from run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          git push --force origin "HEAD:refs/heads/${branch}"
+          echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+
+      - name: Open the PR and close superseded candidates
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          RECORD: ${{ runner.temp }}/evidence/release-candidate.json
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { owner, repo } = context.repo;
+            const rec = JSON.parse(fs.readFileSync(process.env.RECORD, 'utf8'));
+            const branch = process.env.BRANCH;
+            const unit = rec.automated_verification.unit_tests;
+            const checks = rec.automated_verification.staging_checks.checks;
+            const passedChecks = checks.filter((c) => c.result === 'pass').length;
+            const ia = rec.impact_assessment;
+            const dir = `validation/${rec.release.version}`;
+
+            const body = [
+              `## GxP release approval: ${rec.release.version} (candidate \`${rec.release.candidate_tag}\`)`,
+              '',
+              'This PR records the release candidate and its verification. **Merging it promotes the exact image below to production**, after the framework checks the approval again.',
+              '',
+              '| | |',
+              '|---|---|',
+              `| Candidate | \`${rec.release.candidate_tag}\` → commit \`${rec.release.commit.slice(0, 12)}\` |`,
+              `| Image | \`${rec.artifact.reference}\` |`,
+              `| Framework | ${rec.framework.version}${rec.framework.prerelease ? ' (pre-release, not for GxP use)' : ''} |`,
+              `| Started by | @${rec.release.initiator} |`,
+              `| Change control | ${ia.change_control_id} · impact **${ia.gxp_impact}** · path **${ia.validation_path}** · ${ia.impacted_requirements.join(', ') || 'no requirements'} |`,
+              `| Impact assessment approval | [PR #${ia.approval.pull_request}](${ia.approval.url}) by ${ia.approval.approved_by.map((a) => '@' + a.login).join(', ')} |`,
+              `| Unit tests | ${unit.failed === 0 ? '✅' : '❌'} ${unit.passed}/${unit.total} passed |`,
+              `| Staging checks | ${passedChecks === checks.length ? '✅' : '❌'} ${passedChecks}/${checks.length} passed |`,
+              `| Evidence | [candidate run](${rec.candidate_run.url}), artifact \`${rec.evidence_artifact}\` |`,
+              '',
+              '### Steps',
+              `1. **Verifier**: verify the candidate, complete \`${dir}/verification.md\` in this PR and set \`Overall result: PASS\`.`,
+              `2. **Approver** (listed in \`.gxp/roles.yml\`, did not start this release and did not edit this PR): review the evidence and the verification record, then **approve** this PR.`,
+              '3. **Merge.** The promotion workflow checks the approval and deploys the same image to production.',
+              '',
+              `> Do not edit \`${dir}/release-candidate.json\`. Promotion compares it byte for byte with the evidence of the candidate run.`,
+            ].join('\n');
+
+            const existing = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+            let pr = existing.find((p) => p.head.ref === branch);
+            if (pr) {
+              ({ data: pr } = await github.rest.pulls.update({ owner, repo, pull_number: pr.number, body }));
+            } else {
+              ({ data: pr } = await github.rest.pulls.create({
+                owner, repo, head: branch, base: process.env.DEFAULT_BRANCH, body,
+                title: `GxP release approval: ${rec.release.version} (${rec.release.candidate_tag})`,
+              }));
+            }
+
+            // STAGING holds one candidate at a time, so a new candidate supersedes all open ones.
+            const superseded = existing.filter((p) => p.head.ref.startsWith('release/v') && p.head.ref !== branch);
+            for (const old of superseded) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: old.number,
+                body: `Superseded by #${pr.number} (\`${rec.release.candidate_tag}\`). Staging now runs the newer candidate, so this one can no longer be approved.` });
+              await github.rest.pulls.update({ owner, repo, pull_number: old.number, state: 'closed' });
+            }
+
+            await core.summary
+              .addHeading('6 · Release approval PR', 2)
+              .addRaw(`Opened <a href="${pr.html_url}">#${pr.number}</a> for <code>${rec.release.candidate_tag}</code>.`, true)
+              .addRaw(superseded.length ? `Closed superseded: ${superseded.map((p) => '#' + p.number).join(', ')}.` : '', true)
+              .write();

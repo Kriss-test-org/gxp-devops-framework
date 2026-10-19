@@ -1,0 +1,564 @@
+# GxP production promotion
+#
+# Called by an application repository when a release approval PR (opened by gxp-candidate.yml)
+# is merged, i.e. when validation/<version>/release-candidate.json changes on the default branch.
+# Re-checks the approval and the evidence, deploys the exact approved image to (simulated)
+# PRODUCTION without rebuilding, and records the release.
+#
+# The caller must grant: contents: write, packages: write, pull-requests: read,
+# id-token: write, actions: read.
+
+name: GxP production promotion
+
+on:
+  workflow_call:
+    inputs:
+      container-port:
+        description: Port the application listens on inside the container.
+        type: number
+        default: 8080
+      ui-expected-text:
+        description: Text the home page must contain. Empty to skip the check.
+        type: string
+        default: ''
+
+jobs:
+  approval:
+    name: 1 · Verify the release approval
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      id-token: write
+    outputs:
+      version: ${{ steps.record.outputs.version }}
+      candidate-tag: ${{ steps.record.outputs.candidate_tag }}
+      commit: ${{ steps.record.outputs.commit }}
+      image: ${{ steps.record.outputs.image }}
+      digest: ${{ steps.record.outputs.digest }}
+      reference: ${{ steps.record.outputs.reference }}
+      production-config: ${{ steps.record.outputs.production_config }}
+      production-config-sha256: ${{ steps.record.outputs.production_config_sha256 }}
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Identify the framework version
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::The calling workflow must grant 'id-token: write' so the framework can identify its own version."
+            exit 1
+          fi
+          token=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=gxp-framework-identity" | jq -r '.value')
+          echo "::add-mask::${token}"
+          payload=$(cut -d. -f2 <<<"${token}" | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          claims=$(base64 -d <<<"${payload}")
+          ref=$(jq -r '.job_workflow_ref' <<<"${claims}")
+          sha=$(jq -r '.job_workflow_sha' <<<"${claims}")
+          version="${ref##*@refs/tags/}"
+          if [[ "${ref}" != *"@refs/tags/"* ]] || ! [[ "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::The GxP framework must be referenced by a version tag (for example @v1.2.0), not '@${ref##*@}'."
+            exit 1
+          fi
+          prerelease=false
+          if [[ "${version}" == *-* ]]; then
+            prerelease=true
+            echo "::warning::Framework ${version} is a pre-release and must not be used for GxP production releases."
+          fi
+          mkdir -p "${RUNNER_TEMP}/gxp-approval"
+          jq -n --arg version "${version}" --arg ref "${ref}" --arg sha "${sha}" --argjson prerelease "${prerelease}" \
+            '{version: $version, workflow_ref: $ref, workflow_sha: $sha, prerelease: $prerelease}' \
+            > "${RUNNER_TEMP}/gxp-approval/framework.json"
+          echo "Framework: ${ref} (${sha})"
+
+      - name: Locate the release record
+        id: record
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BEFORE}" ] || [[ "${BEFORE}" =~ ^0+$ ]]; then
+            echo "::error::Promotion runs on a push to the default branch that merges a release approval PR."
+            exit 1
+          fi
+          mapfile -t changed < <(git diff --name-only "${BEFORE}" "${GITHUB_SHA}" -- 'validation/*/release-candidate.json')
+          if [ "${#changed[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one changed release record in this push, found ${#changed[@]}: ${changed[*]:-none}."
+            exit 1
+          fi
+          record="${changed[0]}"
+          if [ ! -f "${record}" ]; then
+            echo "::error::${record} was deleted; there is nothing to promote."
+            exit 1
+          fi
+          version=$(basename "$(dirname "${record}")")
+          if [ "$(jq -r '.schema' "${record}")" != "gxp-release-candidate/v1" ] || [ "$(jq -r '.release.version' "${record}")" != "${version}" ]; then
+            echo "::error::${record} is not a valid release candidate record for ${version}."
+            exit 1
+          fi
+          {
+            echo "path=${record}"
+            echo "version=${version}"
+            echo "change_commit=$(git log -1 --format=%H "${GITHUB_SHA}" -- "${record}")"
+            jq -r '"candidate_tag=\(.release.candidate_tag)",
+                   "commit=\(.release.commit)",
+                   "initiator=\(.release.initiator)",
+                   "image=\(.artifact.image)",
+                   "digest=\(.artifact.digest)",
+                   "reference=\(.artifact.reference)",
+                   "candidate_run_id=\(.candidate_run.id)",
+                   "evidence_artifact=\(.evidence_artifact)",
+                   "production_config=\(.configuration.production.path)",
+                   "production_config_sha256=\(.configuration.production.sha256)"' "${record}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check that this is the current, unreleased candidate
+        env:
+          VERSION: ${{ steps.record.outputs.version }}
+          TAG: ${{ steps.record.outputs.candidate_tag }}
+          COMMIT: ${{ steps.record.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Version ${VERSION} is already released."
+            exit 1
+          fi
+          latest=$(git tag -l "v${VERSION}-rc.*" | sort -V | tail -1)
+          if [ "${latest}" != "${TAG}" ]; then
+            echo "::error::${TAG} has been superseded by ${latest}. Only the latest candidate can be promoted."
+            exit 1
+          fi
+          if [ "$(git rev-parse "${TAG}^{commit}")" != "${COMMIT}" ]; then
+            echo "::error::Tag ${TAG} no longer points to the recorded commit ${COMMIT:0:12}."
+            exit 1
+          fi
+
+      - name: Check the verification record
+        env:
+          VERSION: ${{ steps.record.outputs.version }}
+        run: |
+          set -euo pipefail
+          file="validation/${VERSION}/verification.md"
+          if [ ! -f "${file}" ]; then
+            echo "::error::${file} is missing."
+            exit 1
+          fi
+          if ! grep -Eq '^Overall result:[[:space:]]*PASS[[:space:]]*$' "${file}"; then
+            echo "::error file=${file}::The verification record does not conclude 'Overall result: PASS' ($(grep -E '^Overall result:' "${file}" || echo 'no result line'))."
+            exit 1
+          fi
+          cp "${file}" "${RUNNER_TEMP}/gxp-approval/verification.md"
+
+      - name: Download the evidence of the candidate run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ steps.record.outputs.evidence_artifact }}
+          run-id: ${{ steps.record.outputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/gxp-approval/candidate-evidence
+
+      - name: Compare the release record with the evidence
+        env:
+          RECORD: ${{ steps.record.outputs.path }}
+          EVIDENCE: ${{ runner.temp }}/gxp-approval/candidate-evidence
+        run: |
+          set -euo pipefail
+          if ! cmp -s "${RECORD}" "${EVIDENCE}/release-candidate.json"; then
+            echo "::error file=${RECORD}::The release record differs from the one produced by the candidate run. It must not be edited."
+            exit 1
+          fi
+          (cd "${EVIDENCE}" && sha256sum --check --quiet SHA256SUMS)
+          echo "Release record matches the candidate evidence; all evidence files match SHA256SUMS."
+
+      - name: Check the candidate run and the PR approval
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RECORD: ${{ steps.record.outputs.path }}
+          CHANGE_COMMIT: ${{ steps.record.outputs.change_commit }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { owner, repo } = context.repo;
+            const isHuman = (login) => Boolean(login) && !login.endsWith('[bot]') && login !== 'web-flow';
+            const rec = JSON.parse(fs.readFileSync(process.env.RECORD, 'utf8'));
+            const problems = [];
+
+            async function rolesAt(sha) {
+              const { stdout } = await exec.getExecOutput('bash', ['-c', `git show ${sha}:.gxp/roles.yml | yq -o=json '.'`], { silent: true });
+              return JSON.parse(stdout.trim() || 'null') ?? {};
+            }
+
+            // Approval rules: the latest review of an approver listed in .gxp/roles.yml (as it was
+            // before the PR) approves the final commit of the PR, and that approver neither opened
+            // nor contributed to the PR and is not in `excluded`.
+            async function evaluateApproval(pr, excluded = []) {
+              const problems = [];
+              const roles = await rolesAt(pr.base.sha);
+              const approvers = roles.approvers ?? [];
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+              if (files.some((f) => f.filename === '.gxp/roles.yml')) {
+                problems.push('the PR changes .gxp/roles.yml; role changes need their own PR');
+              }
+              const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
+              const contributors = new Set([pr.user.login, ...commits.flatMap((c) => [c.author?.login, c.committer?.login])].filter(isHuman));
+              const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
+              const latest = new Map();
+              for (const r of reviews) {
+                if (r.state !== 'COMMENTED' && r.state !== 'PENDING') latest.set(r.user.login, r);
+              }
+              const assessed = [...latest.values()].map((r) => {
+                const reasons = [];
+                if (r.state !== 'APPROVED') reasons.push(`latest review is ${r.state}`);
+                if (r.commit_id !== pr.head.sha) reasons.push('approved an earlier commit of the PR');
+                if (!approvers.includes(r.user.login)) reasons.push('not an approver in .gxp/roles.yml');
+                if (contributors.has(r.user.login)) reasons.push('opened or contributed to the PR');
+                if (excluded.includes(r.user.login)) reasons.push('started this release');
+                return { login: r.user.login, state: r.state, submitted_at: r.submitted_at, commit_id: r.commit_id,
+                         review_id: r.id, url: r.html_url, valid: reasons.length === 0, reasons };
+              });
+              const blocking = assessed.filter((a) => a.state === 'CHANGES_REQUESTED' && approvers.includes(a.login));
+              if (blocking.length) problems.push(`changes requested by ${blocking.map((a) => a.login).join(', ')}`);
+              const valid = assessed.filter((a) => a.valid);
+              if (!valid.length) {
+                const detail = assessed.map((a) => `${a.login}: ${a.reasons.join(', ')}`).join('; ') || 'no reviews';
+                problems.push(`no valid approval (${detail})`);
+              }
+              return { problems, approvers: valid, reviews: assessed, contributors: [...contributors], commits };
+            }
+
+            // 1. The record must come from a successful candidate run started by the recorded initiator.
+            const { data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: rec.candidate_run.id });
+            const { stdout: runCommit } = await exec.getExecOutput('git', ['rev-parse', `${run.head_sha}^{commit}`], { silent: true });
+            if (run.event !== 'push' || run.head_branch !== rec.release.candidate_tag) problems.push(`run ${run.id} was not triggered by pushing ${rec.release.candidate_tag}`);
+            if (runCommit.trim() !== rec.release.commit) problems.push(`run ${run.id} built ${runCommit.trim().slice(0, 12)}, not the recorded commit`);
+            if (run.conclusion !== 'success') problems.push(`candidate run ${run.id} did not succeed (${run.conclusion})`);
+            if (run.actor?.login !== rec.release.initiator) problems.push(`candidate run was started by ${run.actor?.login}, not ${rec.release.initiator}`);
+
+            // 2. The record must have arrived through the release approval PR for this candidate.
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: process.env.CHANGE_COMMIT });
+            const pr = prs.find((p) => p.merged_at && p.base.ref === process.env.DEFAULT_BRANCH);
+            if (!pr) {
+              core.setFailed(`The release record did not arrive through a merged pull request (commit ${process.env.CHANGE_COMMIT.slice(0, 7)}).`);
+              return;
+            }
+            if (pr.head.ref !== `release/${rec.release.candidate_tag}`) problems.push(`PR #${pr.number} is not the release approval PR for ${rec.release.candidate_tag}`);
+
+            // 3. A valid approval by someone who did not start the release or edit the PR.
+            const approval = await evaluateApproval(pr, [rec.release.initiator]);
+            problems.push(...approval.problems);
+
+            // 4. A person (not the approver) completed the verification record in the PR.
+            const verificationPath = `validation/${rec.release.version}/verification.md`;
+            const verifiers = new Set();
+            for (const c of approval.commits) {
+              if (!isHuman(c.author?.login)) continue;
+              const { data: detail } = await github.rest.repos.getCommit({ owner, repo, ref: c.sha });
+              if (detail.files?.some((f) => f.filename === verificationPath)) verifiers.add(c.author.login);
+            }
+            if (!verifiers.size) problems.push(`nobody completed ${verificationPath} in PR #${pr.number}`);
+
+            const result = {
+              candidate_run: { id: run.id, url: run.html_url, actor: run.actor?.login, conclusion: run.conclusion },
+              pull_request: { number: pr.number, url: pr.html_url, head_sha: pr.head.sha, merged_at: pr.merged_at,
+                              merged_by: pr.merged_by?.login ?? null, merge_commit: process.env.CHANGE_COMMIT },
+              approved_by: approval.approvers.map(({ login, submitted_at, url, review_id }) => ({ login, submitted_at, url, review_id })),
+              verified_by: [...verifiers],
+              reviews: approval.reviews,
+              problems,
+            };
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/gxp-approval/approval.json`, JSON.stringify(result, null, 2));
+
+            const summary = core.summary.addHeading('1 · Release approval', 2).addTable([
+              [{ data: 'Check', header: true }, { data: 'Result', header: true }],
+              ['Candidate', `<code>${rec.release.candidate_tag}</code> → <code>${rec.release.commit.slice(0, 12)}</code>`],
+              ['Image', `<code>${rec.artifact.reference}</code>`],
+              ['Candidate run', `<a href="${run.html_url}">${run.id}</a> started by @${run.actor?.login} (${run.conclusion})`],
+              ['Release PR', `<a href="${pr.html_url}">#${pr.number}</a>`],
+              ['Verified by', [...verifiers].map((v) => '@' + v).join(', ') || 'nobody'],
+              ['Approved by', approval.approvers.map((a) => `@${a.login} at ${a.submitted_at}`).join(', ') || 'nobody'],
+            ]);
+            if (problems.length) summary.addList(problems.map((p) => `❌ ${p}`));
+            await summary.write();
+            if (problems.length) core.setFailed(problems.join('; '));
+
+      - name: Upload approval evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-approval
+          path: ${{ runner.temp }}/gxp-approval
+          if-no-files-found: ignore
+
+  promote:
+    name: 2 · Promote to production
+    needs: approval
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the released commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.approval.outputs.commit }}
+          persist-credentials: false
+
+      - name: Check the production configuration
+        env:
+          CONFIG: ${{ needs.approval.outputs.production-config }}
+          EXPECTED: ${{ needs.approval.outputs.production-config-sha256 }}
+        run: |
+          set -euo pipefail
+          actual=$(sha256sum "${CONFIG}" | cut -d' ' -f1)
+          if [ "${actual}" != "${EXPECTED}" ]; then
+            echo "::error::${CONFIG} (${actual}) differs from the configuration recorded with the candidate (${EXPECTED})."
+            exit 1
+          fi
+
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "${TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Check that the registry still holds the approved image
+        env:
+          IMAGE: ${{ needs.approval.outputs.image }}
+          DIGEST: ${{ needs.approval.outputs.digest }}
+        run: |
+          set -euo pipefail
+          actual="sha256:$(skopeo inspect --raw "docker://${IMAGE}@${DIGEST}" | sha256sum | cut -d' ' -f1)"
+          if [ "${actual}" != "${DIGEST}" ]; then
+            echo "::error::The registry returned ${actual} for ${DIGEST}."
+            exit 1
+          fi
+
+      # v0.1: PRODUCTION is simulated by running the image on the runner. From v0.3 this step
+      # deploys the same digest to Azure Container Apps, behind a protected environment.
+      - name: Deploy the approved image to simulated production
+        env:
+          REFERENCE: ${{ needs.approval.outputs.reference }}
+          CONFIG: ${{ needs.approval.outputs.production-config }}
+          PORT: ${{ inputs.container-port }}
+          VERSION: ${{ needs.approval.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "${REFERENCE}"
+          docker run --detach --name gxp-target --publish "8080:${PORT}" \
+            --env-file "${CONFIG}" \
+            --env APP_ENVIRONMENT=production \
+            --env "APP_RELEASE_VERSION=${VERSION}" \
+            "${REFERENCE}"
+
+      - name: Run the production checks
+        env:
+          REFERENCE: ${{ needs.approval.outputs.reference }}
+          COMMIT: ${{ needs.approval.outputs.commit }}
+          EXPECTED_ENVIRONMENT: production
+          EXPECTED_RELEASE: ${{ needs.approval.outputs.version }}
+          UI_TEXT: ${{ inputs.ui-expected-text }}
+          STAGE_TITLE: 2 · Production deployment checks
+          OUT: ${{ runner.temp }}/gxp-production
+        run: |
+          set -uo pipefail
+          expected_release="${EXPECTED_RELEASE#v}"
+          base="http://127.0.0.1:8080"
+          mkdir -p "${OUT}"
+          checks="[]"
+          record() {
+            checks=$(jq -c --arg c "$1" --arg r "$2" --arg d "$3" '. + [{check: $c, result: $r, detail: $d}]' <<<"${checks}")
+          }
+          for _ in $(seq 1 30); do curl -fsS "${base}/health" >/dev/null 2>&1 && break; sleep 2; done
+
+          configured=$(docker inspect gxp-target --format '{{.Config.Image}}')
+          running_id=$(docker inspect gxp-target --format '{{.Image}}')
+          expected_id=$(docker image inspect "${REFERENCE}" --format '{{.Id}}')
+          if [ "${configured}" = "${REFERENCE}" ] && [ "${running_id}" = "${expected_id}" ]; then
+            record "Running container uses the approved image digest" pass "${configured}"
+          else
+            record "Running container uses the approved image digest" fail "configured ${configured}, image ${running_id}, expected ${expected_id}"
+          fi
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' "${base}/health")
+          if [ "${code}" = "200" ]; then record "Health endpoint responds" pass "HTTP ${code}"; else record "Health endpoint responds" fail "HTTP ${code}"; fi
+
+          version_json=$(curl -fsS "${base}/version" 2>/dev/null || echo '{}')
+          echo "${version_json}" > "${OUT}/version.json"
+          for field in commit:"${COMMIT}" environment:"${EXPECTED_ENVIRONMENT}" release:"${expected_release}"; do
+            key="${field%%:*}"; want="${field#*:}"
+            got=$(jq -r --arg k "${key}" '.[$k] // "missing"' <<<"${version_json}")
+            if [ "${got}" = "${want}" ]; then record "/version reports ${key}" pass "${got}"; else record "/version reports ${key}" fail "got ${got}, expected ${want}"; fi
+          done
+
+          if [ -n "${UI_TEXT}" ]; then
+            curl -fsS "${base}/" -o "${OUT}/home.html" 2>/dev/null || true
+            if grep -qF "${UI_TEXT}" "${OUT}/home.html" 2>/dev/null; then
+              record "Home page shows expected text" pass "${UI_TEXT}"
+            else
+              record "Home page shows expected text" fail "'${UI_TEXT}' not found"
+            fi
+          fi
+
+          docker logs gxp-target > "${OUT}/container.log" 2>&1 || true
+          failed=$(jq '[.[] | select(.result != "pass")] | length' <<<"${checks}")
+          result=$([ "${failed}" -eq 0 ] && echo pass || echo fail)
+          jq -n --arg environment "${EXPECTED_ENVIRONMENT}" --arg reference "${REFERENCE}" --arg result "${result}" \
+                --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson checks "${checks}" \
+            '{environment: $environment, reference: $reference, result: $result, checked_at: $checked_at, checks: $checks}' \
+            > "${OUT}/checks.json"
+          {
+            echo "## ${STAGE_TITLE}"
+            echo "Target: \`${REFERENCE}\`"
+            echo
+            echo "| Check | Result | Detail |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.check) | \(if .result == "pass" then "✅ pass" else "❌ fail" end) | \(.detail) |"' <<<"${checks}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::${failed} production check(s) failed."
+            exit 1
+          fi
+
+      - name: Tag the approved image with the release version
+        env:
+          IMAGE: ${{ needs.approval.outputs.image }}
+          DIGEST: ${{ needs.approval.outputs.digest }}
+          VERSION: ${{ needs.approval.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Adds a tag to the existing manifest. Nothing is rebuilt and the digest must not change.
+          skopeo copy --preserve-digests "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:${VERSION}"
+          tagged="sha256:$(skopeo inspect --raw "docker://${IMAGE}:${VERSION}" | sha256sum | cut -d' ' -f1)"
+          if [ "${tagged}" != "${DIGEST}" ]; then
+            echo "::error::Tag ${VERSION} resolves to ${tagged}, not the approved ${DIGEST}."
+            exit 1
+          fi
+          echo "| Registry tag | \`${IMAGE}:${VERSION}\` → \`${DIGEST}\` |" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload production evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-production
+          path: ${{ runner.temp }}/gxp-production
+          if-no-files-found: ignore
+
+  finalize:
+    name: 3 · Record the release
+    needs: [approval, promote]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Collect the evidence of this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: gxp-*
+          path: ${{ runner.temp }}/release
+
+      - name: Assemble the release record
+        env:
+          DIR: ${{ runner.temp }}/release
+          VERSION: ${{ needs.approval.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "${DIR}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n \
+            --slurpfile candidate gxp-approval/candidate-evidence/release-candidate.json \
+            --slurpfile approval gxp-approval/approval.json \
+            --slurpfile framework gxp-approval/framework.json \
+            --slurpfile production gxp-production/checks.json \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_url "${run_url}" \
+            --arg released_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg version "${VERSION}" \
+            '($candidate[0] | del(.schema)) + {
+              schema: "gxp-release-record/v1",
+              status: "released",
+              release_tag: "v\($version)",
+              approval: ($approval[0] | {pull_request, verified_by, approved_by, candidate_run}),
+              promotion: {
+                framework: $framework[0],
+                run: {id: ($run_id | tonumber), url: $run_url},
+                production_checks: $production[0],
+                released_at: $released_at
+              }
+            }' > release-record.json
+          zip -qr "evidence-v${VERSION}.zip" gxp-approval gxp-production release-record.json
+          sha256sum release-record.json "evidence-v${VERSION}.zip" > SHA256SUMS
+
+      - name: Tag and publish the release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DIR: ${{ runner.temp }}/release
+          VERSION: ${{ needs.approval.outputs.version }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const { owner, repo } = context.repo;
+            const dir = process.env.DIR;
+            const rec = JSON.parse(fs.readFileSync(path.join(dir, 'release-record.json'), 'utf8'));
+            const tag = rec.release_tag;
+
+            try {
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha: rec.release.commit });
+            } catch (error) {
+              const { data: existing } = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              if (existing.object.sha !== rec.release.commit) throw new Error(`${tag} already exists and points to ${existing.object.sha}`);
+            }
+
+            const ia = rec.impact_assessment;
+            const ap = rec.approval;
+            const people = (list) => list.map((p) => '@' + (p.login ?? p)).join(', ');
+            const body = [
+              `GxP release **${rec.release.version}**, promoted from candidate \`${rec.release.candidate_tag}\`.`,
+              '',
+              '| | |',
+              '|---|---|',
+              `| Commit | \`${rec.release.commit}\` |`,
+              `| Image | \`${rec.artifact.reference}\` |`,
+              `| Change control | ${ia.change_control_id} · impact **${ia.gxp_impact}** · path **${ia.validation_path}** |`,
+              `| Impact assessment | [PR #${ia.approval.pull_request}](${ia.approval.url}) approved by ${people(ia.approval.approved_by)} |`,
+              `| Release approval | [PR #${ap.pull_request.number}](${ap.pull_request.url}) verified by ${people(ap.verified_by)}, approved by ${people(ap.approved_by)} |`,
+              `| Started by | @${rec.release.initiator} |`,
+              `| Framework | candidate ${rec.framework.version}, promotion ${rec.promotion.framework.version} |`,
+              `| Candidate run | ${rec.candidate_run.url} |`,
+              `| Promotion run | ${rec.promotion.run.url} |`,
+              `| Released at | ${rec.promotion.released_at} |`,
+              '',
+              'The attached `release-record.json` is the machine-readable record; `evidence-*.zip` holds the evidence. Their SHA-256 values are in `SHA256SUMS`.',
+            ].join('\n');
+
+            const { data: release } = await github.rest.repos.createRelease({
+              owner, repo, tag_name: tag, name: `${rec.release.version}`, body, make_latest: 'true',
+            });
+            for (const name of ['release-record.json', `evidence-v${process.env.VERSION}.zip`, 'SHA256SUMS']) {
+              const data = fs.readFileSync(path.join(dir, name));
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name, data,
+                headers: { 'content-type': 'application/octet-stream', 'content-length': data.length },
+              });
+            }
+
+            await core.summary
+              .addHeading('3 · Release recorded', 2)
+              .addRaw(`Tagged <code>${tag}</code> on <code>${rec.release.commit.slice(0, 12)}</code> and published <a href="${release.html_url}">release ${rec.release.version}</a>.`, true)
+              .addRaw(`Production runs <code>${rec.artifact.reference}</code>, the image built and tested as <code>${rec.release.candidate_tag}</code>.`, true)
+              .write();
+
+      - name: Upload the release record
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gxp-release-record-v${{ needs.approval.outputs.version }}
+          path: |
+            ${{ runner.temp }}/release/release-record.json
+            ${{ runner.temp }}/release/SHA256SUMS
+          retention-days: 90
