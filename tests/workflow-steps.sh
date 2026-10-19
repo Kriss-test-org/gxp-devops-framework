@@ -94,6 +94,11 @@ decide "pull request without a change request rejected" 1 '.pull_requests["2"].l
 decide "pull request without code review rejected" 1 '.pull_requests["2"].reviews = []'
 decide "code review by the code author rejected" 1 '.pull_requests["2"].reviews[0].login = "alice"'
 decide "code review of an earlier commit rejected" 1 '.pull_requests["2"].reviews[0].commit_id = "old"'
+decide "code review given after the merge rejected" 1 '.pull_requests["2"].reviews[0].submitted_at = "2026-10-20T11:00:00Z"'
+decide "deleted change request rejected with a clear message" 1 '.issues["1"] = {type: "missing"}'
+grep -q 'referenced by PR #2, does not exist' "$GITHUB_STEP_SUMMARY" \
+  && { pass=$((pass+1)); echo "PASS  message names the deleted request and the PR"; } \
+  || { fail=$((fail+1)); echo "FAIL  message names the deleted request and the PR"; }
 decide "change request without approval rejected" 1 '.issues["1"].comments = []'
 decide "approval by the requester rejected" 1 '.issues["1"].requester = "bob"'
 decide "approval by someone not listed rejected" 1 '.issues["1"].comments[0].author = "mallory"'

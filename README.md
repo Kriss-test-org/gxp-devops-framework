@@ -33,8 +33,8 @@ design, controls and roadmap.
 | 4 · Staging deployment and automated checks | | Runs the digest on staging, checks it; cancels superseded runs |
 | 5 · Evidence pack | | Release candidate record and all evidence with SHA-256 list |
 | 6 · Verification | a verifier (`gxp-verification`) | Checks the verifier and the `PASS <reference>` comment |
-| 7 · Promote X.Y.Z to production | a release approver (`gxp-production`) | Checks separation of duties, deploys the same digest, checks it |
-| 8 · Release X.Y.Z | | Moves `main`, tags `vX.Y.Z`, GitHub release with PDF report, closes the change requests |
+| 7 · Promote to production | a release approver (`gxp-production`) | Checks separation of duties, deploys the same digest, checks it |
+| 8 · Release | | Moves `main`, tags `vX.Y.Z`, GitHub release with PDF report, closes the change requests |
 
 If a gate fails (for example the approval comment was missing), use **Re-run failed jobs**: the gate waits
 again and the newest approval counts. Do not use *Re-run all jobs*; the build refuses to build the same

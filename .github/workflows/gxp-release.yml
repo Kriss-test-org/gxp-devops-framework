@@ -213,8 +213,13 @@ jobs:
             }`;
             const issues = {};
             for (const number of issueNumbers) {
-              const result = await github.graphql(query, { owner, repo, number });
-              const item = result.repository.issueOrPullRequest;
+              let item = null;
+              try {
+                item = (await github.graphql(query, { owner, repo, number })).repository.issueOrPullRequest;
+              } catch (error) {
+                // A deleted or never-created issue is reported as an error, not as null.
+                if (!/could not resolve/i.test(error.message)) throw error;
+              }
               if (!item) { issues[number] = { type: 'missing' }; continue; }
               if (item.__typename !== 'Issue') { issues[number] = { type: item.__typename }; continue; }
               issues[number] = {
@@ -285,9 +290,11 @@ jobs:
               if fields["impact"] == "medium" and fields["path"] == "abbreviated": errors.append("impact medium requires path targeted or full")
               return fields, reqs, errors
 
-          def evaluate_issue(number, issue):
+          def evaluate_issue(number, issue, referenced_by):
+              if issue.get("type") == "missing":
+                  return None, f"#{number}, referenced by {referenced_by}, does not exist (was it deleted?)"
               if issue.get("type") != "Issue":
-                  return None, f"#{number} is not an issue of this repository"
+                  return None, f"#{number}, referenced by {referenced_by}, is not an issue"
               if issue["state"] != "OPEN":
                   return None, f"#{number} '{issue['title']}' is closed (already released or rejected)"
               requester, decision, notes = issue["requester"], None, []
@@ -335,10 +342,13 @@ jobs:
               for r in pr["reviews"]:  # oldest first
                   if r["state"] in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                       latest[r["login"]] = r
+              # A review only counts if it was given before the merge; approving afterwards proves nothing.
               reviews = [r for r in latest.values() if r["state"] == "APPROVED" and r["commit_id"] == pr["head_sha"]
-                         and r["login"] in role["change_approvers"] and r["login"] not in authors]
+                         and r["login"] in role["change_approvers"] and r["login"] not in authors
+                         and r["submitted_at"] <= pr["merged_at"]]
               if not reviews:
-                  problems.append(f"PR #{pr['number']} '{pr['title']}' has no approving code review of its final commit by a change approver who did not write the code")
+                  problems.append(f"PR #{pr['number']} '{pr['title']}' was merged without an approving code review of its final commit"
+                                  " by a change approver who did not write the code")
               if not pr["linked_issues"]:
                   problems.append(f"PR #{pr['number']} '{pr['title']}' does not reference a change request; add 'Closes #<issue>' to its description")
               issue_numbers += [n for n in pr["linked_issues"] if n not in issue_numbers]
@@ -351,7 +361,8 @@ jobs:
 
           change_requests = []
           for number in sorted(issue_numbers):
-              cr, problem = evaluate_issue(number, data["issues"].get(str(number), {"type": "missing"}))
+              referenced_by = ", ".join(f"PR #{p['number']}" for p in pull_requests if number in p["linked_issues"])
+              cr, problem = evaluate_issue(number, data["issues"].get(str(number), {"type": "missing"}), referenced_by)
               if problem:
                   problems.append(problem)
               else:
@@ -929,7 +940,7 @@ jobs:
           if-no-files-found: ignore
 
   promote:
-    name: 7 · Promote ${{ needs.intake.outputs.version }} to production
+    name: 7 · Promote to production
     needs: [intake, build, verification]
     runs-on: ubuntu-24.04
     # The run waits here until a release approver of this environment approves the release.
@@ -1134,7 +1145,7 @@ jobs:
           if-no-files-found: ignore
 
   record:
-    name: 8 · Release ${{ needs.intake.outputs.version }}
+    name: 8 · Release
     needs: [intake, promote]
     runs-on: ubuntu-24.04
     permissions:

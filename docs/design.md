@@ -109,8 +109,9 @@ flowchart TD
 Intake rules:
 
 - Every commit on `stage` that is not on `main` arrived through a merged pull request into `stage`.
-- Every such pull request references at least one change request (`Closes #123`) and has an approving review
-  of its final commit by a change approver who is not its author and did not author any of its commits.
+- Every such pull request references at least one existing change request (`Closes #123`) and has an
+  approving review of its final commit, submitted before the merge, by a change approver who is not its author
+  and did not author any of its commits.
 - Every referenced change request is an open issue whose latest decision is a valid `/approve` by a change
   approver who is not the requester, with valid fields, a comment that was never edited, and a request text not
   edited after the approval. A later `/reject` withdraws an earlier approval; a later `/approve` restores it.

@@ -21,6 +21,13 @@ From change request to production.
   - Release record and PDF report list the change requests, pull requests, reviews and code authors.
 - Impact assessment files and release candidate tags are no longer used.
 
+### beta.2
+
+- A pull request that references a deleted or non-existent issue is reported clearly ("#2, referenced by
+  PR #3, does not exist") instead of failing with a GraphQL error.
+- A code review only counts if it was submitted before the pull request was merged.
+- Jobs 7 and 8 have fixed names, so skipped jobs no longer show an unresolved expression.
+
 ## v0.1.0 (not released; superseded by v0.2.0)
 
 First version of the release flow, as one workflow run per release candidate.
