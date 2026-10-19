@@ -1,0 +1,49 @@
+# Tests of the framework itself. Runs on every change and on every version tag, so each framework
+# release carries its own test results.
+name: Framework tests
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint (includes shellcheck)
+        run: docker run --rm -v "${GITHUB_WORKSPACE}:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+  step-tests:
+    name: Workflow step tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the step tests
+        # An explicit `shell: bash` adds pipefail, so a failing test is not hidden by tee.
+        shell: bash
+        run: bash tests/workflow-steps.sh | tee "${RUNNER_TEMP}/step-tests.log"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Workflow step tests"
+            echo '```'
+            grep -E '^(PASS|FAIL|RESULT)' "${RUNNER_TEMP}/step-tests.log" || echo "no results"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

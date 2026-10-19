@@ -79,6 +79,19 @@ configuration, JUnit test results, `deploy/*.env`, `.gxp/roles.yml` and an impac
 
 Container images go to GitHub Container Registry (`ghcr.io/<org>/<repo>`); the first build creates the package.
 
+## Testing the framework
+
+[framework-tests.yml](.github/workflows/framework-tests.yml) runs on every change and every version tag:
+
+- **Lint workflows:** actionlint, including shellcheck on every script step.
+- **Workflow step tests:** [tests/workflow-steps.sh](tests/workflow-steps.sh) runs the script steps of both
+  workflows with test inputs and checks they accept valid input and reject what they must block (invalid
+  impact assessments, unlisted initiators, failed tests, edited records, tampered evidence, superseded or
+  already released candidates, incomplete verification).
+
+Steps that depend on GitHub itself (API calls, OIDC, cross-repository calls, registry) are tested end to end
+with [gxp-demo-app](https://github.com/Kriss-test-org/gxp-demo-app).
+
 ## Versioning
 
 Releases are tags `vMAJOR.MINOR.PATCH`. Applications must reference a tag; the framework refuses branch

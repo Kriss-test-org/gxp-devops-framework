@@ -11,4 +11,5 @@ First version of the release flow.
 - `gxp-promote.yml`: approval re-verification (candidate run, PR, reviews, verification record, evidence
   integrity), simulated production with the same digest, registry version tag, `vX.Y.Z` git tag and GitHub
   release with the release record.
+- `framework-tests.yml`: actionlint and workflow step tests on every change and version tag.
 - Design document with decision log.
