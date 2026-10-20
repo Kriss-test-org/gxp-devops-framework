@@ -1,0 +1,133 @@
+# GxP pull request check
+#
+# Called by an application repository for pull requests into its stage branch. Applies the release
+# intake rules before the merge, so problems show on the pull request instead of in a failed release run:
+# every referenced change request exists and is validly approved, and the code is approved by a change
+# approver who did not write it. Make it a required status check in the stage branch ruleset.
+# The release intake applies the same rules again and remains the authority.
+#
+# The caller must grant: contents: read, pull-requests: read, issues: read.
+
+name: GxP pull request check
+
+on:
+  workflow_call:
+    inputs:
+      production-branch:
+        description: Branch whose .gxp/roles.yml decides who may approve.
+        type: string
+        default: main
+
+jobs:
+  check:
+    name: Change requests and code review
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Read the roles
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.production-branch }}
+          sparse-checkout: .gxp
+          persist-credentials: false
+
+      - name: Check the pull request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            const { stdout } = await exec.getExecOutput('bash', ['-c', "yq -o=json '.' .gxp/roles.yml 2>/dev/null || echo '{}'"], { silent: true });
+            const roles = JSON.parse(stdout.trim() || '{}') ?? {};
+            const approvers = roles.change_approvers ?? [];
+            const isHuman = (login) => Boolean(login) && !login.endsWith('[bot]') && login !== 'web-flow';
+            const problems = [];
+            const rows = [];
+
+            // 1. Change requests: same rules as the release intake.
+            const refPattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|implement(?:s|ed)?)\s*:?\s+#(\d+)/gi;
+            const linked = [...new Set([...(pr.body ?? '').matchAll(refPattern)].map((m) => Number(m[1])))];
+            if (!linked.length) problems.push('The description references no change request. Add `Closes #<issue>` for each change request this pull request implements (one keyword per issue).');
+            const query = `query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                issueOrPullRequest(number: $number) {
+                  __typename
+                  ... on Issue { title state lastEditedAt author { login }
+                    comments(first: 100) { nodes { body createdAt lastEditedAt author { login } } } }
+                }
+              }
+            }`;
+            for (const n of linked) {
+              let item = null;
+              try { item = (await github.graphql(query, { owner, repo, number: n })).repository.issueOrPullRequest; }
+              catch (error) { if (!/could not resolve/i.test(error.message)) throw error; }
+              if (!item) { problems.push(`#${n} does not exist (was it deleted?).`); rows.push([`#${n}`, '❌ does not exist']); continue; }
+              if (item.__typename !== 'Issue') { problems.push(`#${n} is not an issue.`); rows.push([`#${n}`, '❌ not an issue']); continue; }
+              if (item.state !== 'OPEN') { problems.push(`#${n} is closed (already released or rejected).`); rows.push([`#${n} ${item.title}`, '❌ closed']); continue; }
+              const requester = item.author?.login;
+              let decision = null;
+              const notes = [];
+              for (const c of item.comments.nodes) {
+                const body = (c.body ?? '').trim();
+                const command = (body.split('\n')[0] ?? '').trim().toLowerCase();
+                if (!command.startsWith('/approve') && !command.startsWith('/reject')) continue;
+                const who = c.author?.login;
+                if (!approvers.includes(who)) { notes.push(`${who} is not a change approver`); continue; }
+                if (who === requester) { notes.push(`${who} requested it`); continue; }
+                if (command.startsWith('/reject')) { decision = { rejected: who }; continue; }
+                const fields = {};
+                for (const line of body.split('\n').slice(1)) {
+                  const at = line.indexOf(':');
+                  if (at > 0) fields[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
+                }
+                const impact = (fields.impact ?? '').toLowerCase();
+                const path = (fields.path ?? '').toLowerCase();
+                const type = (fields.type ?? '').toLowerCase();
+                const reqs = (fields.requirements ?? '').split(/[,\s]+/).filter(Boolean);
+                const errors = [];
+                if (!['none', 'low', 'medium', 'high'].includes(impact)) errors.push('impact');
+                if (!['abbreviated', 'targeted', 'full'].includes(path)) errors.push('path');
+                if (!['fix', 'feature', 'breaking'].includes(type)) errors.push('type');
+                if (impact !== 'none' && !reqs.length) errors.push('requirements');
+                if (!fields.reason) errors.push('reason');
+                if (impact === 'high' && path !== 'full') errors.push('high impact needs path full');
+                if (impact === 'medium' && path === 'abbreviated') errors.push('medium impact needs targeted or full');
+                if (c.lastEditedAt) errors.push('approval comment edited');
+                if (errors.length) { notes.push(`approval by ${who} invalid (${errors.join(', ')})`); continue; }
+                decision = { approvedBy: who, at: c.createdAt, type, impact };
+              }
+              if (!decision) { problems.push(`#${n} is not approved yet (${notes.join('; ') || 'no /approve comment'}).`); rows.push([`#${n} ${item.title}`, '❌ not approved']); continue; }
+              if (decision.rejected) { problems.push(`#${n} was rejected by ${decision.rejected}.`); rows.push([`#${n} ${item.title}`, '❌ rejected']); continue; }
+              if (item.lastEditedAt && item.lastEditedAt > decision.at) { problems.push(`#${n}: the request text was edited after approval; it needs to be approved again.`); rows.push([`#${n} ${item.title}`, '❌ edited after approval']); continue; }
+              rows.push([`#${n} ${item.title}`, `✅ approved by @${decision.approvedBy} (${decision.type}, impact ${decision.impact})`]);
+            }
+
+            // 2. Code review of the latest commit by a change approver who did not write the code.
+            const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: number, per_page: 100 });
+            const authors = new Set([pr.user.login, ...commits.map((c) => c.author?.login)].filter(isHuman));
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: number, per_page: 100 });
+            const latest = new Map();
+            for (const r of reviews) if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(r.state)) latest.set(r.user.login, r);
+            const valid = [...latest.values()].filter((r) => r.state === 'APPROVED' && r.commit_id === pr.head.sha
+              && approvers.includes(r.user.login) && !authors.has(r.user.login));
+            const eligible = approvers.filter((a) => !authors.has(a));
+            if (!valid.length) {
+              problems.push(`Waiting for an approving review of the latest commit by a change approver who did not write the code: ${eligible.map((a) => '@' + a).join(', ') || 'nobody eligible in .gxp/roles.yml'}.`);
+            }
+            rows.push(['Code review', valid.length ? `✅ approved by ${valid.map((r) => '@' + r.user.login).join(', ')}` : `⏳ waiting for ${eligible.map((a) => '@' + a).join(', ')}`]);
+
+            const summary = core.summary.addHeading('GxP pull request check', 2)
+              .addTable([[{ data: 'Item', header: true }, { data: 'Status', header: true }], ...rows]);
+            if (problems.length) {
+              summary.addList(problems)
+                .addRaw('After fixing a change request (approval, description), re-run this check. A new review re-runs it automatically.', true);
+            } else {
+              summary.addRaw('Ready to merge. Merging starts the release run.', true);
+            }
+            await summary.write();
+            for (const p of problems) core.error(p);
+            if (problems.length) core.setFailed(`${problems.length} problem(s) before this pull request can be merged.`);

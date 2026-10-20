@@ -14,7 +14,7 @@
 # or rejects it with "/reject <reason>". This workflow gives immediate feedback and keeps the labels
 # up to date. It is not the authority: the release run re-checks every approval from the issue itself.
 #
-# The caller must grant: issues: write, contents: read.
+# The caller must grant: issues: write, contents: read, pull-requests: read.
 
 name: GxP change request
 
@@ -25,6 +25,10 @@ on:
         description: Branch whose .gxp/roles.yml decides who may approve.
         type: string
         default: main
+      stage-branch:
+        description: Branch that receives pull requests from develop.
+        type: string
+        default: stage
 
 jobs:
   change-request:
@@ -34,6 +38,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      pull-requests: read
     steps:
       - name: Read the roles
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,11 +49,35 @@ jobs:
 
       - name: Handle the change request
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          STAGE: ${{ inputs.stage-branch }}
+          PRODUCTION: ${{ inputs.production-branch }}
         with:
           script: |
             const { owner, repo } = context.repo;
             const issue = context.payload.issue;
             const number = issue.number;
+
+            // A deleted change request leaves the code of its pull requests without an approved request.
+            // Warn on every pull request into stage that references it and whose code is not in production yet.
+            if (context.eventName === 'issues' && context.payload.action === 'deleted') {
+              const pattern = new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|implement(?:s|ed)?)\\s*:?\\s+#${number}\\b`, 'i');
+              const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'all', base: process.env.STAGE, per_page: 100 });
+              for (const p of prs) {
+                if (!pattern.test(p.body ?? '') || (p.state === 'closed' && !p.merged_at)) continue;
+                if (p.merged_at) {
+                  const { data: cmp } = await github.rest.repos.compareCommits({ owner, repo, base: process.env.PRODUCTION, head: p.merge_commit_sha });
+                  if (cmp.status === 'identical' || cmp.status === 'behind') continue; // already released
+                }
+                await github.rest.issues.createComment({ owner, repo, issue_number: p.number, body: [
+                  `⚠️ Change request #${number} ("${issue.title}") was deleted, so this pull request's code no longer has an approved change request.`,
+                  p.merged_at
+                    ? `Its code is on \`${process.env.STAGE}\`, so the next release run will stop. Either edit this description to reference another approved change request, or remove the code from \`${process.env.STAGE}\`.`
+                    : 'Edit this description to reference another approved change request before merging.',
+                ].join('\n\n') });
+              }
+              return;
+            }
             const { stdout } = await exec.getExecOutput('bash', ['-c', "yq -o=json '.' .gxp/roles.yml 2>/dev/null || echo '{}'"], { silent: true });
             const roles = JSON.parse(stdout.trim() || '{}') ?? {};
             const approvers = roles.change_approvers ?? [];

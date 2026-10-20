@@ -79,6 +79,7 @@ jobs:
       version: ${{ steps.decide.outputs.version }}
       label: ${{ steps.decide.outputs.label }}
       code-authors: ${{ steps.decide.outputs.code_authors }}
+      change-requests: ${{ steps.decide.outputs.change_requests }}
       commit: ${{ steps.candidate.outputs.commit }}
       image: ${{ steps.candidate.outputs.image }}
     steps:
@@ -292,7 +293,7 @@ jobs:
 
           def evaluate_issue(number, issue, referenced_by):
               if issue.get("type") == "missing":
-                  return None, f"#{number}, referenced by {referenced_by}, does not exist (was it deleted?)"
+                  return None, f"#{number}, referenced by {referenced_by}, does not exist (was it deleted?). Edit {referenced_by}'s description to reference an approved change request, or remove its code from {stage}"
               if issue.get("type") != "Issue":
                   return None, f"#{number}, referenced by {referenced_by}, is not an issue"
               if issue["state"] != "OPEN":
@@ -348,7 +349,8 @@ jobs:
                          and r["submitted_at"] <= pr["merged_at"]]
               if not reviews:
                   problems.append(f"PR #{pr['number']} '{pr['title']}' was merged without an approving code review of its final commit"
-                                  " by a change approver who did not write the code")
+                                  " by a change approver who did not write the code. A review after the merge does not count:"
+                                  f" remove its code from {stage} and bring it back through a reviewed pull request")
               if not pr["linked_issues"]:
                   problems.append(f"PR #{pr['number']} '{pr['title']}' does not reference a change request; add 'Closes #<issue>' to its description")
               issue_numbers += [n for n in pr["linked_issues"] if n not in issue_numbers]
@@ -404,7 +406,8 @@ jobs:
           if problems:
               raise SystemExit(1)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"version={result['version']}\nlabel={result['label']}\ncode_authors={json.dumps(result['code_authors'])}\n")
+              fh.write(f"version={result['version']}\nlabel={result['label']}\ncode_authors={json.dumps(result['code_authors'])}\n"
+                       f"change_requests={json.dumps([cr['number'] for cr in change_requests])}\n")
           PY
 
       - name: Check that the version is not released yet
@@ -770,6 +773,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      issues: write
     steps:
       - name: Check out the release candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -856,6 +860,45 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+      - name: Read the roles from the production branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.production-branch }}
+          sparse-checkout: .gxp
+          path: gxp-roles
+          persist-credentials: false
+
+      # The Review deployments dialog cannot show instructions, so they go where people look before it:
+      # a notice on top of the run, the run summary, and a comment on each change request.
+      - name: Ask for verification
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          LABEL: ${{ needs.intake.outputs.label }}
+          CHANGE_REQUESTS: ${{ needs.intake.outputs.change-requests }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { stdout } = await exec.getExecOutput('bash', ['-c', "yq -o=json '.' gxp-roles/.gxp/roles.yml"], { silent: true });
+            const roles = JSON.parse(stdout.trim() || '{}') ?? {};
+            const verifiers = (roles.verifiers ?? []).map((v) => '@' + v).join(', ') || '(no verifiers in .gxp/roles.yml)';
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const label = process.env.LABEL;
+            const how = 'click **Review deployments**, tick **gxp-verification**, write the comment `PASS <reference of your verification record>` (for example `PASS TR-0042`) and click **Approve and deploy**';
+            core.notice(`${label} is on staging. Verifier (${verifiers}): ${how.replace(/\*\*|`/g, '')}.`, { title: 'Next: verification' });
+            await core.summary.addHeading('Next: verification', 2)
+              .addRaw(`<b>${label}</b> is on staging and waits for a verifier: ${verifiers}.`, true)
+              .addList([
+                'Verify the change requests on staging and review the evidence of this run (artifacts below).',
+                'At the top of this run, click <b>Review deployments</b> and tick <b>gxp-verification</b>.',
+                'Write the comment <code>PASS &lt;reference of your verification record&gt;</code>, for example <code>PASS TR-0042</code>. Anything else fails the step.',
+                'Click <b>Approve and deploy</b>. If you reject, the candidate is rejected.',
+                'If the step failed because of the comment, use <b>Re-run failed jobs</b> and approve again; nothing is rebuilt.',
+              ]).write();
+            for (const issue_number of JSON.parse(process.env.CHANGE_REQUESTS || '[]')) {
+              await github.rest.issues.createComment({ owner, repo, issue_number,
+                body: `🧪 Candidate \`${label}\` with this change is on staging and waits for verification by ${verifiers}: in the [release run](${runUrl}), ${how}.` });
+            }
+
   verification:
     name: 6 · Verification
     needs: [intake, evidence]
@@ -867,6 +910,7 @@ jobs:
       contents: read
       actions: read
       deployments: read
+      issues: write
     outputs:
       verifier: ${{ steps.check.outputs.verifier }}
     steps:
@@ -929,6 +973,37 @@ jobs:
             if (problems.length) summary.addList(problems.map((p) => `❌ ${p}`));
             await summary.write();
             if (problems.length) core.setFailed(problems.join('; '));
+
+      - name: Ask for production approval
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          LABEL: ${{ needs.intake.outputs.label }}
+          VERSION: ${{ needs.intake.outputs.version }}
+          VERIFIER: ${{ steps.check.outputs.verifier }}
+          CODE_AUTHORS: ${{ needs.intake.outputs.code-authors }}
+          CHANGE_REQUESTS: ${{ needs.intake.outputs.change-requests }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { stdout } = await exec.getExecOutput('bash', ['-c', "yq -o=json '.' .gxp/roles.yml"], { silent: true });
+            const roles = JSON.parse(stdout.trim() || '{}') ?? {};
+            const excluded = new Set([process.env.VERIFIER, ...JSON.parse(process.env.CODE_AUTHORS || '[]')]);
+            const eligible = (roles.release_approvers ?? []).filter((a) => !excluded.has(a)).map((a) => '@' + a).join(', ')
+              || '(nobody: every release approver wrote code for or verified this release)';
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const how = 'click **Review deployments**, tick **gxp-production** and click **Approve and deploy** (a comment is optional)';
+            core.notice(`${process.env.LABEL} was verified by @${process.env.VERIFIER}. Release approver (${eligible}): ${how.replace(/\*\*/g, '')} to release ${process.env.VERSION}.`, { title: 'Next: production approval' });
+            await core.summary.addHeading('Next: production approval', 2)
+              .addRaw(`Verified by @${process.env.VERIFIER}. Release <b>${process.env.VERSION}</b> waits for a release approver who did not write code for it or verify it: ${eligible}.`, true)
+              .addList([
+                'Review the change requests, the code reviews, the automated checks and the verification above.',
+                'At the top of this run, click <b>Review deployments</b>, tick <b>gxp-production</b> and click <b>Approve and deploy</b>.',
+                'Approving deploys the same image to production, moves the production branch, tags the version and closes the change requests.',
+              ]).write();
+            for (const issue_number of JSON.parse(process.env.CHANGE_REQUESTS || '[]')) {
+              await github.rest.issues.createComment({ owner, repo, issue_number,
+                body: `✅ Verified by @${process.env.VERIFIER}. Release ${process.env.VERSION} waits for production approval by ${eligible}: in the [release run](${runUrl}), ${how}.` });
+            }
 
       - name: Upload verification evidence
         if: always()

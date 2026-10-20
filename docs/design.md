@@ -43,7 +43,7 @@ Where a formal change record is required, it lives in the eQMS (Dot Compliance) 
 
 | Repository / branch | Contains |
 |---|---|
-| `gxp-devops-framework` | Reusable workflows `gxp-release.yml` and `gxp-change-request.yml`, their tests, this design, the changelog. Released as lightweight version tags. |
+| `gxp-devops-framework` | Reusable workflows `gxp-release.yml`, `gxp-change-request.yml` and `gxp-pr-check.yml`, their tests, this design, the changelog. Released as lightweight version tags. |
 | Application repo | Source, Dockerfile, tests, `deploy/*.env`, `.gxp/roles.yml`, `docs/requirements.md`, two caller workflows pinned to a framework version, environments `gxp-verification` and `gxp-production`. |
 | `develop` | Work in progress. Lovable works here; its preview is DEV. |
 | `stage` | Receives pull requests from `develop`. Every push starts a release run. |
@@ -59,7 +59,7 @@ Where a formal change record is required, it lives in the eQMS (Dot Compliance) 
 | Unit tests with JUnit XML | Test names start with the requirement ID they verify, e.g. `[URS-001] limits are inclusive`. |
 | `deploy/staging.env`, `deploy/production.env` | Non-secret configuration per environment. |
 | `.gxp/roles.yml` (schema `gxp-roles/v2`) | `change_approvers`, `verifiers`, `release_approvers`. Read from `main`. |
-| Caller workflows | `release.yml` (push to `stage`) and `change-requests.yml` (issue events). |
+| Caller workflows | `release.yml` (push to `stage`), `change-requests.yml` (issue events) and `pr-check.yml` (pull requests into `stage`, a required check in the `stage` ruleset). |
 | Environments | `gxp-verification` and `gxp-production` with required reviewers; `gxp-production` with "Prevent self-review". |
 
 ### System boundary

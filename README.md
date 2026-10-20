@@ -72,18 +72,42 @@ jobs:
 name: GxP change requests
 on:
   issues:
-    types: [opened, edited]
+    types: [opened, edited, deleted]
   issue_comment:
     types: [created]
 permissions:
   contents: read
   issues: write
+  pull-requests: read
 jobs:
   change-request:
     name: Change request
     if: ${{ !github.event.issue.pull_request }}
     uses: Kriss-test-org/gxp-devops-framework/.github/workflows/gxp-change-request.yml@v0.2.0
 ```
+
+```yaml
+# .github/workflows/pr-check.yml
+name: GxP pull request check
+on:
+  pull_request:
+    branches: [stage]
+    types: [opened, edited, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, dismissed]
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+jobs:
+  pr-check:
+    name: GxP
+    if: github.event.pull_request.base.ref == 'stage'
+    uses: Kriss-test-org/gxp-devops-framework/.github/workflows/gxp-pr-check.yml@v0.2.0
+```
+
+The pull request check applies the intake rules before the merge. Make its check
+(**GxP / Change requests and code review**) required in the `stage` ruleset.
 
 The application also provides the items in
 [design section 3](docs/design.md#what-an-application-must-provide), including `.gxp/roles.yml`:
