@@ -21,6 +21,18 @@ From change request to production.
   - Release record and PDF report list the change requests, pull requests, reviews and code authors.
 - Impact assessment files and release candidate tags are no longer used.
 
+### beta.3
+
+- `gxp-pr-check.yml` (new): checks pull requests into `stage` before the merge (referenced change requests
+  exist and are validly approved; latest commit approved by a change approver who did not write the code).
+  Intended as a required status check in the `stage` ruleset.
+- Guidance for the people at the gates, since the *Review deployments* dialog cannot show instructions:
+  a notice at the top of the run, a "Next:" section in the run summary and a comment on each change request,
+  when the candidate waits for verification and again when it waits for production approval.
+- Deleting a change request posts a warning on every pull request into `stage` that references it and whose
+  code is not in production yet.
+- Intake errors for deleted change requests and post-merge reviews say how to fix them.
+
 ### beta.2
 
 - A pull request that references a deleted or non-existent issue is reported clearly ("#2, referenced by
